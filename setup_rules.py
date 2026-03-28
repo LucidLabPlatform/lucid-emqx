@@ -1,0 +1,664 @@
+#!/usr/bin/env python3
+"""
+EMQX Rule Engine provisioning for LUCID central command.
+
+Creates all data-integration connectors, actions, and rules that move
+every MQTT DB write out of Python and into EMQX directly.
+
+Idempotent — safe to re-run at any time.
+
+Usage:
+    python3 services/emqx/setup_rules.py
+
+Environment variables (all have sensible defaults):
+    EMQX_URL              EMQX management API base URL  (default: http://localhost:18083)
+    EMQX_USERNAME         EMQX dashboard username        (default: lucid)
+    EMQX_PASSWORD         EMQX dashboard password        (default: REDACTED)
+    LUCID_FLEET_CORE_URL  Fleet Core base URL            (default: http://lucid-fleet-core:5000)
+    LUCID_DB_HOST         Postgres host:port             (default: lucid-db:5432)
+    LUCID_DB_NAME         Postgres database name         (default: lucid)
+    LUCID_DB_USER         Postgres username              (default: lucid)
+    LUCID_DB_PASSWORD     Postgres password              (default: REDACTED)
+"""
+
+import os
+import sys
+import time
+
+import httpx
+
+EMQX_URL      = os.environ.get("EMQX_URL",      "http://localhost:18083")
+EMQX_USERNAME = os.environ.get("EMQX_USERNAME", "admin")
+EMQX_PASSWORD = os.environ.get("EMQX_PASSWORD", "public")
+LUCID_FLEET_CORE_URL = os.environ.get(
+    "LUCID_FLEET_CORE_URL",
+    "http://lucid-fleet-core:5000",
+)
+LUCID_DB_HOST     = os.environ.get("LUCID_DB_HOST",     "lucid-db:5432")
+LUCID_DB_NAME     = os.environ.get("LUCID_DB_NAME",     "lucid")
+LUCID_DB_USER     = os.environ.get("LUCID_DB_USER",     "lucid")
+LUCID_DB_PASSWORD = os.environ.get("LUCID_DB_PASSWORD", "REDACTED")
+
+
+# ---------------------------------------------------------------------------
+# Thin EMQX REST client
+# ---------------------------------------------------------------------------
+
+class EMQXClient:
+    def __init__(self) -> None:
+        self._base = EMQX_URL
+        self._token = self._login()
+
+    def _login(self) -> str:
+        last_error = None
+        for _ in range(20):
+            try:
+                resp = httpx.post(
+                    f"{self._base}/api/v5/login",
+                    json={"username": EMQX_USERNAME, "password": EMQX_PASSWORD},
+                    timeout=30,
+                )
+                resp.raise_for_status()
+                return resp.json()["token"]
+            except Exception as exc:
+                last_error = exc
+                time.sleep(3)
+        raise RuntimeError(f"Could not log in to EMQX: {last_error}")
+
+    def _h(self) -> dict:
+        return {"Authorization": f"Bearer {self._token}", "Content-Type": "application/json"}
+
+    def get(self, path: str) -> httpx.Response:
+        return httpx.get(f"{self._base}{path}", headers=self._h(), timeout=30)
+
+    def post(self, path: str, body: dict) -> httpx.Response:
+        return httpx.post(f"{self._base}{path}", json=body, headers=self._h(), timeout=30)
+
+    def put(self, path: str, body: dict) -> httpx.Response:
+        return httpx.put(f"{self._base}{path}", json=body, headers=self._h(), timeout=30)
+
+    def delete(self, path: str) -> httpx.Response:
+        return httpx.delete(f"{self._base}{path}", headers=self._h(), timeout=30)
+
+
+# ---------------------------------------------------------------------------
+# Idempotent resource helpers
+# ---------------------------------------------------------------------------
+
+def ensure_connector(client: EMQXClient, spec: dict) -> None:
+    name      = spec["name"]
+    type_name = spec["type"]
+    resp = client.get(f"/api/v5/connectors/{type_name}:{name}")
+    if resp.status_code == 200:
+        print(f"  [skip]   connector {name}")
+        return
+    resp = client.post("/api/v5/connectors", spec)
+    if resp.status_code not in (200, 201):
+        print(f"  [ERROR]  connector {name}: {resp.text}", file=sys.stderr)
+        sys.exit(1)
+    status = resp.json().get("status", "?")
+    print(f"  [create] connector {name} ({status})")
+
+
+def ensure_action(client: EMQXClient, spec: dict) -> None:
+    name      = spec["name"]
+    type_name = spec["type"]
+    resp = client.get(f"/api/v5/actions/{type_name}:{name}")
+    if resp.status_code == 200:
+        update_body = {k: v for k, v in spec.items() if k not in ("name", "type")}
+        upd = client.put(f"/api/v5/actions/{type_name}:{name}", update_body)
+        if upd.status_code not in (200, 201):
+            print(f"  [ERROR]  action update {name}: {upd.text}", file=sys.stderr)
+            sys.exit(1)
+        print(f"  [update] action {name}")
+        return
+    resp = client.post("/api/v5/actions", spec)
+    if resp.status_code not in (200, 201):
+        print(f"  [ERROR]  action {name}: {resp.text}", file=sys.stderr)
+        sys.exit(1)
+    status = resp.json().get("status", "?")
+    print(f"  [create] action {name} ({status})")
+
+
+def ensure_rule(client: EMQXClient, spec: dict) -> None:
+    """Create or update a rule by description (idempotent)."""
+    desc = spec.get("description", "")
+    resp = client.get("/api/v5/rules?limit=500")
+    resp.raise_for_status()
+    existing_id = None
+    for rule in resp.json().get("data", []):
+        if rule.get("description") == desc:
+            existing_id = rule["id"]
+            break
+    if existing_id:
+        # Update the existing rule SQL so fixes are applied on re-run
+        upd = client.put(f"/api/v5/rules/{existing_id}", spec)
+        if upd.status_code not in (200, 201):
+            print(f"  [ERROR]  rule update '{desc}': {upd.text}", file=sys.stderr)
+            sys.exit(1)
+        print(f"  [update] rule '{desc}' (id={existing_id})")
+        return
+    resp = client.post("/api/v5/rules", spec)
+    if resp.status_code not in (200, 201):
+        print(f"  [ERROR]  rule '{desc}': {resp.text}", file=sys.stderr)
+        sys.exit(1)
+    print(f"  [create] rule '{desc}' (id={resp.json().get('id', '?')})")
+
+
+# ---------------------------------------------------------------------------
+# SQL helpers
+# ---------------------------------------------------------------------------
+
+def _agent_id_from_topic(_prefix: str) -> str:
+    """
+    Extract agent_id from the MQTT client ID.
+
+    In LUCID every agent connects with its agent_id as the MQTT clientid,
+    so we can use `clientid` directly instead of regex-extracting from the
+    topic string. (EMQX 6.x dropped support for nth/regex_match topic
+    extraction — use clientid + substr instead.)
+    """
+    return "clientid as agent_id"
+
+
+def _component_ids_from_topic(_prefix: str) -> str:
+    """
+    Extract agent_id and component_id from component topics.
+
+    Topic pattern: lucid/agents/{agent_id}/components/{component_id}/...
+    - agent_id  = MQTT clientid (always equal to agent_id in LUCID)
+    - component_id = first path segment after '/components/'
+
+    The prefix 'lucid/agents/' is 13 chars; '/components/' is 12 chars.
+    Total fixed prefix = strlen(clientid) + 25. EMQX substr is 1-indexed, so
+    component_id starts at position strlen(clientid) + 26.
+    """
+    return (
+        "clientid as agent_id, "
+        "nth(1, split(substr(topic, strlen(clientid)+26), '/')) as component_id"
+    )
+
+
+UPSERT_AGENTS_SQL = """
+INSERT INTO agents (agent_id, first_seen_ts, last_seen_ts)
+VALUES (${agent_id}, ${received_ts}::text::timestamptz, ${received_ts}::text::timestamptz)
+ON CONFLICT (agent_id) DO UPDATE SET last_seen_ts = EXCLUDED.last_seen_ts
+""".strip()
+
+UPSERT_COMPONENTS_SQL = """
+INSERT INTO components (agent_id, component_id, first_seen_ts, last_seen_ts)
+VALUES (${agent_id}, ${component_id}, ${received_ts}::text::timestamptz, ${received_ts}::text::timestamptz)
+ON CONFLICT (agent_id, component_id) DO UPDATE SET last_seen_ts = EXCLUDED.last_seen_ts
+""".strip()
+
+
+def _pgsql_action(name: str, sql: str) -> dict:
+    return {
+        "type": "pgsql",
+        "name": name,
+        "connector": "lucid-postgres",
+        "parameters": {"sql": sql.strip()},
+    }
+
+
+def _http_action(name: str, path: str) -> dict:
+    return {
+        "type": "http",
+        "name": name,
+        "connector": "lucid-cc-http",
+        "parameters": {
+            "path": path,
+            "method": "post",
+            "body": "${.}",
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# Resource definitions
+# ---------------------------------------------------------------------------
+
+def connectors() -> list[dict]:
+    return [
+        {
+            "type": "http",
+            "name": "lucid-cc-http",
+            "url": LUCID_FLEET_CORE_URL,
+            "pool_size": 4,
+            "ssl": {"enable": False},
+        },
+    ]
+
+
+def actions() -> list[dict]:
+    return [
+        # ── shared FK-parent upserts ─────────────────────────────────────
+        _pgsql_action("upsert-agents", UPSERT_AGENTS_SQL),
+        _pgsql_action("upsert-components", UPSERT_COMPONENTS_SQL),
+
+        # ── agent retained ───────────────────────────────────────────────
+        _pgsql_action("agent-metadata-sink", """
+            INSERT INTO agent_metadata (agent_id, version, platform, architecture, received_ts)
+            VALUES (${agent_id}, ${version}, ${platform}, ${architecture}, ${received_ts}::text::timestamptz)
+            ON CONFLICT (agent_id) DO UPDATE SET
+                version=EXCLUDED.version, platform=EXCLUDED.platform,
+                architecture=EXCLUDED.architecture, received_ts=EXCLUDED.received_ts
+        """),
+        _pgsql_action("agent-status-sink", """
+            INSERT INTO agent_status (agent_id, state, connected_since_ts, uptime_s, version, received_ts)
+            VALUES (${agent_id}, ${state}, ${connected_since_ts}::text::timestamptz, ${uptime_s}::text::float8,
+                    ${version}, ${received_ts}::text::timestamptz)
+            ON CONFLICT (agent_id) DO UPDATE SET
+                state=EXCLUDED.state, connected_since_ts=EXCLUDED.connected_since_ts,
+                uptime_s=EXCLUDED.uptime_s, version=EXCLUDED.version,
+                received_ts=EXCLUDED.received_ts
+        """),
+        _pgsql_action("agent-state-sink", """
+            INSERT INTO agent_state (agent_id, cpu_percent, memory_percent, disk_percent, components, received_ts)
+            VALUES (${agent_id}, ${cpu_percent}::text::float8, ${memory_percent}::text::float8,
+                    ${disk_percent}::text::float8, ${components}, ${received_ts}::text::timestamptz)
+            ON CONFLICT (agent_id) DO UPDATE SET
+                cpu_percent=EXCLUDED.cpu_percent, memory_percent=EXCLUDED.memory_percent,
+                disk_percent=EXCLUDED.disk_percent, components=EXCLUDED.components,
+                received_ts=EXCLUDED.received_ts
+        """),
+        _pgsql_action("agent-cfg-sink", """
+            INSERT INTO agent_cfg (agent_id, heartbeat_s, received_ts)
+            VALUES (${agent_id}, ${heartbeat_s}::text::integer, ${received_ts}::text::timestamptz)
+            ON CONFLICT (agent_id) DO UPDATE SET
+                heartbeat_s=EXCLUDED.heartbeat_s, received_ts=EXCLUDED.received_ts
+        """),
+        _pgsql_action("agent-cfg-logging-sink", """
+            INSERT INTO agent_cfg_logging (agent_id, log_level, received_ts)
+            VALUES (${agent_id}, ${log_level}, ${received_ts}::text::timestamptz)
+            ON CONFLICT (agent_id) DO UPDATE SET
+                log_level=EXCLUDED.log_level, received_ts=EXCLUDED.received_ts
+        """),
+        _pgsql_action("agent-cfg-telemetry-sink", """
+            INSERT INTO agent_cfg_telemetry (
+                agent_id,
+                cpu_pct_enabled, cpu_pct_interval_s, cpu_pct_threshold,
+                memory_pct_enabled, memory_pct_interval_s, memory_pct_threshold,
+                disk_pct_enabled, disk_pct_interval_s, disk_pct_threshold,
+                received_ts
+            ) VALUES (
+                ${agent_id},
+                ${cpu_pct_enabled}::text::boolean, ${cpu_pct_interval_s}::text::integer, ${cpu_pct_threshold}::text::float8,
+                ${memory_pct_enabled}::text::boolean, ${memory_pct_interval_s}::text::integer, ${memory_pct_threshold}::text::float8,
+                ${disk_pct_enabled}::text::boolean, ${disk_pct_interval_s}::text::integer, ${disk_pct_threshold}::text::float8,
+                ${received_ts}::text::timestamptz
+            )
+            ON CONFLICT (agent_id) DO UPDATE SET
+                cpu_pct_enabled=EXCLUDED.cpu_pct_enabled,
+                cpu_pct_interval_s=EXCLUDED.cpu_pct_interval_s,
+                cpu_pct_threshold=EXCLUDED.cpu_pct_threshold,
+                memory_pct_enabled=EXCLUDED.memory_pct_enabled,
+                memory_pct_interval_s=EXCLUDED.memory_pct_interval_s,
+                memory_pct_threshold=EXCLUDED.memory_pct_threshold,
+                disk_pct_enabled=EXCLUDED.disk_pct_enabled,
+                disk_pct_interval_s=EXCLUDED.disk_pct_interval_s,
+                disk_pct_threshold=EXCLUDED.disk_pct_threshold,
+                received_ts=EXCLUDED.received_ts
+        """),
+
+        # ── agent streaming ──────────────────────────────────────────────
+        _http_action("agent-logs-http", "/api/internal/ingest-logs"),
+        _pgsql_action("agent-telemetry-sink", """
+            INSERT INTO agent_telemetry (agent_id, metric, value, received_ts)
+            VALUES (${agent_id}, ${metric}, ${value}::text::float8, ${received_ts}::text::timestamptz)
+        """),
+        _pgsql_action("agent-events-sink", """
+            INSERT INTO agent_events (agent_id, action, request_id, ok, error, received_ts)
+            VALUES (${agent_id}, ${action}, ${request_id}, ${ok}::text::boolean,
+                    ${error}, ${received_ts}::text::timestamptz)
+        """),
+        _pgsql_action("agent-commands-backfill", """
+            UPDATE commands
+            SET result_ok=${ok}::text::boolean, result_ts=${received_ts}::text::timestamptz
+            WHERE request_id=${request_id} AND result_ok IS NULL AND ${request_id} != ''
+        """),
+
+        # ── component retained ───────────────────────────────────────────
+        _pgsql_action("component-metadata-sink", """
+            INSERT INTO component_metadata (agent_id, component_id, version, capabilities, received_ts)
+            VALUES (${agent_id}, ${component_id}, ${version}, ${capabilities}, ${received_ts}::text::timestamptz)
+            ON CONFLICT (agent_id, component_id) DO UPDATE SET
+                version=EXCLUDED.version, capabilities=EXCLUDED.capabilities,
+                received_ts=EXCLUDED.received_ts
+        """),
+        _pgsql_action("component-status-sink", """
+            INSERT INTO component_status (agent_id, component_id, state, received_ts)
+            VALUES (${agent_id}, ${component_id}, ${state}, ${received_ts}::text::timestamptz)
+            ON CONFLICT (agent_id, component_id) DO UPDATE SET
+                state=EXCLUDED.state, received_ts=EXCLUDED.received_ts
+        """),
+        _pgsql_action("component-state-sink", """
+            INSERT INTO component_state (agent_id, component_id, payload, received_ts)
+            VALUES (${agent_id}, ${component_id}, ${comp_payload}, ${received_ts}::text::timestamptz)
+            ON CONFLICT (agent_id, component_id) DO UPDATE SET
+                payload=EXCLUDED.payload, received_ts=EXCLUDED.received_ts
+        """),
+        _pgsql_action("component-cfg-sink", """
+            INSERT INTO component_cfg (agent_id, component_id, payload, received_ts)
+            VALUES (${agent_id}, ${component_id}, ${comp_payload}, ${received_ts}::text::timestamptz)
+            ON CONFLICT (agent_id, component_id) DO UPDATE SET
+                payload=EXCLUDED.payload, received_ts=EXCLUDED.received_ts
+        """),
+        _pgsql_action("component-cfg-logging-sink", """
+            INSERT INTO component_cfg_logging (agent_id, component_id, log_level, received_ts)
+            VALUES (${agent_id}, ${component_id}, ${log_level}, ${received_ts}::text::timestamptz)
+            ON CONFLICT (agent_id, component_id) DO UPDATE SET
+                log_level=EXCLUDED.log_level, received_ts=EXCLUDED.received_ts
+        """),
+        _pgsql_action("component-cfg-telemetry-sink", """
+            INSERT INTO component_cfg_telemetry (agent_id, component_id, payload, received_ts)
+            VALUES (${agent_id}, ${component_id}, ${comp_payload}, ${received_ts}::text::timestamptz)
+            ON CONFLICT (agent_id, component_id) DO UPDATE SET
+                payload=EXCLUDED.payload, received_ts=EXCLUDED.received_ts
+        """),
+
+        # ── component streaming ──────────────────────────────────────────
+        _http_action("component-logs-http", "/api/internal/ingest-logs"),
+        _pgsql_action("component-telemetry-sink", """
+            INSERT INTO component_telemetry (agent_id, component_id, metric, value, received_ts)
+            VALUES (${agent_id}, ${component_id}, ${metric}, ${value}::text::float8,
+                    ${received_ts}::text::timestamptz)
+        """),
+        _pgsql_action("component-events-sink", """
+            INSERT INTO component_events
+                (agent_id, component_id, action, request_id, ok, applied, error, received_ts)
+            VALUES (${agent_id}, ${component_id}, ${action}, ${request_id},
+                    ${ok}::text::boolean, ${applied}, ${error}, ${received_ts}::text::timestamptz)
+        """),
+        _pgsql_action("component-commands-backfill", """
+            UPDATE commands
+            SET result_ok=${ok}::text::boolean, result_ts=${received_ts}::text::timestamptz
+            WHERE request_id=${request_id} AND result_ok IS NULL AND ${request_id} != ''
+        """),
+
+        # ── client events ────────────────────────────────────────────────
+        _http_action("client-events-http", "/api/internal/client-event"),
+    ]
+
+
+def rules() -> list[dict]:
+    def rule(desc: str, sql: str, action_refs: list[str]) -> dict:
+        return {
+            "sql": sql.strip(),
+            "actions": action_refs,
+            "enable": True,
+            "description": desc,
+        }
+
+    # ── agent-level rules ────────────────────────────────────────────────
+
+    agent_metadata_sql = f"""
+        SELECT
+            {_agent_id_from_topic('metadata')},
+            payload.version as version,
+            payload.platform as platform,
+            payload.architecture as architecture,
+            now_rfc3339() as received_ts
+        FROM "lucid/agents/+/metadata"
+    """
+
+    agent_status_sql = f"""
+        SELECT
+            {_agent_id_from_topic('status')},
+            payload.state as state,
+            payload.connected_since as connected_since_ts,
+            payload.uptime_s as uptime_s,
+            payload.version as version,
+            now_rfc3339() as received_ts
+        FROM "lucid/agents/+/status"
+    """
+
+    agent_state_sql = f"""
+        SELECT
+            {_agent_id_from_topic('state')},
+            payload.cpu_percent as cpu_percent,
+            payload.memory_percent as memory_percent,
+            payload.disk_percent as disk_percent,
+            payload.components as components,
+            now_rfc3339() as received_ts
+        FROM "lucid/agents/+/state"
+    """
+
+    agent_cfg_sql = f"""
+        SELECT
+            {_agent_id_from_topic('cfg')},
+            payload.heartbeat_s as heartbeat_s,
+            now_rfc3339() as received_ts
+        FROM "lucid/agents/+/cfg"
+    """
+
+    agent_cfg_logging_sql = f"""
+        SELECT
+            {_agent_id_from_topic('cfg/logging')},
+            payload.level as log_level,
+            now_rfc3339() as received_ts
+        FROM "lucid/agents/+/cfg/logging"
+    """
+
+    agent_cfg_telemetry_sql = f"""
+        SELECT
+            {_agent_id_from_topic('cfg/telemetry')},
+            payload.cpu_percent.enabled as cpu_pct_enabled,
+            payload.cpu_percent.interval_s as cpu_pct_interval_s,
+            payload.cpu_percent.threshold as cpu_pct_threshold,
+            payload.memory_percent.enabled as memory_pct_enabled,
+            payload.memory_percent.interval_s as memory_pct_interval_s,
+            payload.memory_percent.threshold as memory_pct_threshold,
+            payload.disk_percent.enabled as disk_pct_enabled,
+            payload.disk_percent.interval_s as disk_pct_interval_s,
+            payload.disk_percent.threshold as disk_pct_threshold,
+            now_rfc3339() as received_ts
+        FROM "lucid/agents/+/cfg/telemetry"
+    """
+
+    agent_logs_sql = f"""
+        SELECT
+            {_agent_id_from_topic('logs')},
+            payload as log_payload,
+            now_rfc3339() as received_ts
+        FROM "lucid/agents/+/logs"
+    """
+
+    agent_telemetry_sql = """
+        SELECT
+            clientid as agent_id,
+            substr(topic, strlen(clientid)+25) as metric,
+            payload.value as value,
+            now_rfc3339() as received_ts
+        FROM "lucid/agents/+/telemetry/#"
+        WHERE is_not_null(payload.value)
+    """
+
+    agent_events_sql = """
+        SELECT
+            clientid as agent_id,
+            coalesce(payload.action, substr(topic, strlen(clientid)+19)) as action,
+            coalesce(payload.request_id, '') as request_id,
+            coalesce(payload.ok, coalesce(payload.success, false)) as ok,
+            payload.error as error,
+            payload.applied as applied,
+            now_rfc3339() as received_ts
+        FROM "lucid/agents/+/evt/#"
+    """
+
+    # ── component-level rules ────────────────────────────────────────────
+
+    comp_metadata_sql = f"""
+        SELECT
+            {_component_ids_from_topic('metadata')},
+            payload.version as version,
+            payload.capabilities as capabilities,
+            now_rfc3339() as received_ts
+        FROM "lucid/agents/+/components/+/metadata"
+    """
+
+    comp_status_sql = f"""
+        SELECT
+            {_component_ids_from_topic('status')},
+            payload.state as state,
+            now_rfc3339() as received_ts
+        FROM "lucid/agents/+/components/+/status"
+    """
+
+    # component state/cfg/cfg_telemetry payloads are stored as raw JSONB
+    comp_state_sql = f"""
+        SELECT
+            {_component_ids_from_topic('state')},
+            payload as comp_payload,
+            now_rfc3339() as received_ts
+        FROM "lucid/agents/+/components/+/state"
+    """
+
+    comp_cfg_sql = f"""
+        SELECT
+            {_component_ids_from_topic('cfg')},
+            payload as comp_payload,
+            now_rfc3339() as received_ts
+        FROM "lucid/agents/+/components/+/cfg"
+    """
+
+    comp_cfg_logging_sql = f"""
+        SELECT
+            {_component_ids_from_topic('cfg/logging')},
+            payload.level as log_level,
+            now_rfc3339() as received_ts
+        FROM "lucid/agents/+/components/+/cfg/logging"
+    """
+
+    comp_cfg_telemetry_sql = f"""
+        SELECT
+            {_component_ids_from_topic('cfg/telemetry')},
+            payload as comp_payload,
+            now_rfc3339() as received_ts
+        FROM "lucid/agents/+/components/+/cfg/telemetry"
+    """
+
+    comp_logs_sql = f"""
+        SELECT
+            {_component_ids_from_topic('logs')},
+            payload as log_payload,
+            now_rfc3339() as received_ts
+        FROM "lucid/agents/+/components/+/logs"
+    """
+
+    comp_telemetry_sql = """
+        SELECT
+            clientid as agent_id,
+            nth(1, split(substr(topic, strlen(clientid)+26), '/')) as component_id,
+            nth(3, split(substr(topic, strlen(clientid)+26), '/')) as metric,
+            payload.value as value,
+            now_rfc3339() as received_ts
+        FROM "lucid/agents/+/components/+/telemetry/#"
+        WHERE is_not_null(payload.value)
+    """
+
+    comp_events_sql = """
+        SELECT
+            clientid as agent_id,
+            nth(1, split(substr(topic, strlen(clientid)+26), '/')) as component_id,
+            coalesce(payload.action, nth(3, split(substr(topic, strlen(clientid)+26), '/'))) as action,
+            coalesce(payload.request_id, '') as request_id,
+            coalesce(payload.ok, coalesce(payload.success, false)) as ok,
+            payload.applied as applied,
+            payload.error as error,
+            now_rfc3339() as received_ts
+        FROM "lucid/agents/+/components/+/evt/#"
+    """
+
+    client_events_sql = """
+        SELECT
+            clientid as agent_id,
+            event as event_type,
+            now_rfc3339() as ts
+        FROM "$events/client_connected", "$events/client_disconnected"
+    """
+
+    return [
+        # agent retained
+        rule("lucid:agent-metadata",      agent_metadata_sql,      ["pgsql:upsert-agents", "pgsql:agent-metadata-sink"]),
+        rule("lucid:agent-status",        agent_status_sql,        ["pgsql:upsert-agents", "pgsql:agent-status-sink"]),
+        rule("lucid:agent-state",         agent_state_sql,         ["pgsql:upsert-agents", "pgsql:agent-state-sink"]),
+        rule("lucid:agent-cfg",           agent_cfg_sql,           ["pgsql:upsert-agents", "pgsql:agent-cfg-sink"]),
+        rule("lucid:agent-cfg-logging",   agent_cfg_logging_sql,   ["pgsql:upsert-agents", "pgsql:agent-cfg-logging-sink"]),
+        rule("lucid:agent-cfg-telemetry", agent_cfg_telemetry_sql, ["pgsql:upsert-agents", "pgsql:agent-cfg-telemetry-sink"]),
+        # agent streaming
+        rule("lucid:agent-logs",          agent_logs_sql,          ["pgsql:upsert-agents", "http:agent-logs-http"]),
+        rule("lucid:agent-telemetry",     agent_telemetry_sql,     ["pgsql:upsert-agents", "pgsql:agent-telemetry-sink"]),
+        rule("lucid:agent-events",        agent_events_sql,        ["pgsql:upsert-agents", "pgsql:agent-events-sink", "pgsql:agent-commands-backfill"]),
+        # component retained
+        rule("lucid:component-metadata",      comp_metadata_sql,      ["pgsql:upsert-agents", "pgsql:upsert-components", "pgsql:component-metadata-sink"]),
+        rule("lucid:component-status",        comp_status_sql,        ["pgsql:upsert-agents", "pgsql:upsert-components", "pgsql:component-status-sink"]),
+        rule("lucid:component-state",         comp_state_sql,         ["pgsql:upsert-agents", "pgsql:upsert-components", "pgsql:component-state-sink"]),
+        rule("lucid:component-cfg",           comp_cfg_sql,           ["pgsql:upsert-agents", "pgsql:upsert-components", "pgsql:component-cfg-sink"]),
+        rule("lucid:component-cfg-logging",   comp_cfg_logging_sql,   ["pgsql:upsert-agents", "pgsql:upsert-components", "pgsql:component-cfg-logging-sink"]),
+        rule("lucid:component-cfg-telemetry", comp_cfg_telemetry_sql, ["pgsql:upsert-agents", "pgsql:upsert-components", "pgsql:component-cfg-telemetry-sink"]),
+        # component streaming
+        rule("lucid:component-logs",          comp_logs_sql,          ["pgsql:upsert-agents", "pgsql:upsert-components", "http:component-logs-http"]),
+        rule("lucid:component-telemetry",     comp_telemetry_sql,     ["pgsql:upsert-agents", "pgsql:upsert-components", "pgsql:component-telemetry-sink"]),
+        rule("lucid:component-events",        comp_events_sql,        ["pgsql:upsert-agents", "pgsql:upsert-components", "pgsql:component-events-sink", "pgsql:component-commands-backfill"]),
+        # client connect/disconnect
+        rule("lucid:client-events", client_events_sql, ["http:client-events-http"]),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def ensure_postgres_connector(client: EMQXClient) -> None:
+    """Idempotently create the lucid-postgres connector in EMQX."""
+    spec = {
+        "type": "pgsql",
+        "name": "lucid-postgres",
+        "server": LUCID_DB_HOST,
+        "database": LUCID_DB_NAME,
+        "username": LUCID_DB_USER,
+        "password": LUCID_DB_PASSWORD,
+        "pool_size": 8,
+        "enable": True,
+    }
+    r = client.get("/api/v5/connectors/pgsql:lucid-postgres")
+    if r.status_code == 200:
+        update_body = {k: v for k, v in spec.items() if k not in ("type", "name")}
+        upd = client.put("/api/v5/connectors/pgsql:lucid-postgres", update_body)
+        if upd.status_code not in (200, 201):
+            print(f"  [ERROR] lucid-postgres connector update: {upd.text}", file=sys.stderr)
+            sys.exit(1)
+        print("  [update] lucid-postgres connector")
+        return
+    resp = client.post("/api/v5/connectors", spec)
+    if resp.status_code not in (200, 201):
+        print(f"  [ERROR] lucid-postgres connector: {resp.text}", file=sys.stderr)
+        sys.exit(1)
+    print("  [ok] lucid-postgres connector created")
+
+
+def main() -> None:
+    print(f"Connecting to EMQX at {EMQX_URL} ...")
+    client = EMQXClient()
+    print("Authenticated.\n")
+
+    ensure_postgres_connector(client)
+
+    print("── Connectors ──────────────────────────────────")
+    for spec in connectors():
+        ensure_connector(client, spec)
+
+    print("\n── Actions ─────────────────────────────────────")
+    for spec in actions():
+        ensure_action(client, spec)
+
+    print("\n── Rules ───────────────────────────────────────")
+    for spec in rules():
+        ensure_rule(client, spec)
+
+    print("\nDone. All LUCID EMQX rules are in place.")
+
+
+if __name__ == "__main__":
+    main()
