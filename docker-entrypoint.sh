@@ -16,4 +16,10 @@ if [ -z "${LDAP_SERVER:-}" ]; then
   unset EMQX_AUTHENTICATION__2__QUERY_TIMEOUT
 fi
 
+# Preserve the broker startup command even if the wrapped image CMD is not
+# carried through by the build/runtime path.
+if [ "$#" -eq 0 ]; then
+  set -- /opt/emqx/bin/emqx foreground
+fi
+
 exec /usr/bin/docker-entrypoint.sh "$@"

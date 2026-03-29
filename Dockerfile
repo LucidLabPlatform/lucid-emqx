@@ -3,3 +3,4 @@ FROM emqx/emqx-enterprise:6.1.1
 COPY --chmod=755 docker-entrypoint.sh /usr/local/bin/lucid-emqx-entrypoint.sh
 
 ENTRYPOINT ["/usr/local/bin/lucid-emqx-entrypoint.sh"]
+CMD ["/opt/emqx/bin/emqx", "foreground"]
