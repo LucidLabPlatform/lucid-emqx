@@ -58,6 +58,18 @@ docker run --rm \
 
 The provisioner retries login up to 20 times (3-second intervals) to tolerate broker startup delay.
 
+Verify the installed EMQX resources with:
+
+```bash
+python3 verify_resources.py \
+  --url http://localhost:18083 \
+  --username lucid \
+  --password '<dashboard-password>' \
+  --profile minimal
+```
+
+Use `--profile full` only when the full stack is running and EMQX is expected to have built-in-database auth and built-in-database authorization configured. LDAP is optional in this profile and will be reported when present.
+
 ---
 
 ## Environment variables
