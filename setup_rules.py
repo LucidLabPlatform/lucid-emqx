@@ -750,15 +750,16 @@ def schemas() -> list[dict]:
 
 def ensure_schema(client: EMQXClient, spec: dict) -> None:
     name = spec["name"]
-    resp = client.get(f"/api/v5/schemas/{name}")
+    resp = client.get(f"/api/v5/schema_registry/{name}")
     if resp.status_code == 200:
-        upd = client.put(f"/api/v5/schemas/{name}", spec)
+        update_body = {k: v for k, v in spec.items() if k != "name"}
+        upd = client.put(f"/api/v5/schema_registry/{name}", update_body)
         if upd.status_code not in (200, 201):
             print(f"  [ERROR]  schema update {name}: {upd.text}", file=sys.stderr)
             sys.exit(1)
         print(f"  [update] schema {name}")
         return
-    resp = client.post("/api/v5/schemas", spec)
+    resp = client.post("/api/v5/schema_registry", spec)
     if resp.status_code not in (200, 201):
         print(f"  [ERROR]  schema {name}: {resp.text}", file=sys.stderr)
         sys.exit(1)
@@ -774,9 +775,10 @@ def schema_validations() -> list[dict]:
         return {
             "name": name,
             "topics": topics,
+            "enable": True,
             "strategy": "all_pass",
             "failure_action": "drop",
-            "log_failure_at": "warning",
+            "log_failure": {"level": "warning"},
             "checks": [{"type": "json_schema", "schema": schema}],
         }
 
@@ -807,15 +809,9 @@ def schema_validations() -> list[dict]:
 
 def ensure_schema_validation(client: EMQXClient, spec: dict) -> None:
     name = spec["name"]
-    resp = client.get("/api/v5/schema_validations")
-    resp.raise_for_status()
-    existing_id = None
-    for item in resp.json().get("data", []):
-        if item.get("name") == name:
-            existing_id = item["id"]
-            break
-    if existing_id:
-        upd = client.put(f"/api/v5/schema_validations/{existing_id}", spec)
+    resp = client.get(f"/api/v5/schema_validations/validation/{name}")
+    if resp.status_code == 200:
+        upd = client.put("/api/v5/schema_validations", spec)
         if upd.status_code not in (200, 201):
             print(f"  [ERROR]  validation update {name}: {upd.text}", file=sys.stderr)
             sys.exit(1)
@@ -837,8 +833,9 @@ def message_transformations() -> list[dict]:
         {
             "name": "lucid-json-normalize",
             "topics": ["lucid/#"],
+            "enable": True,
             "failure_action": "drop",
-            "log_failure_at": "warning",
+            "log_failure": {"level": "warning"},
             "payload_decoder": {"type": "json"},
             "payload_encoder": {"type": "json"},
             "operations": [],
@@ -848,21 +845,15 @@ def message_transformations() -> list[dict]:
 
 def ensure_message_transformation(client: EMQXClient, spec: dict) -> None:
     name = spec["name"]
-    resp = client.get("/api/v5/transformations")
-    resp.raise_for_status()
-    existing_id = None
-    for item in resp.json().get("data", []):
-        if item.get("name") == name:
-            existing_id = item["id"]
-            break
-    if existing_id:
-        upd = client.put(f"/api/v5/transformations/{existing_id}", spec)
+    resp = client.get(f"/api/v5/message_transformations/transformation/{name}")
+    if resp.status_code == 200:
+        upd = client.put("/api/v5/message_transformations", spec)
         if upd.status_code not in (200, 201):
             print(f"  [ERROR]  transformation update {name}: {upd.text}", file=sys.stderr)
             sys.exit(1)
         print(f"  [update] transformation {name}")
         return
-    resp = client.post("/api/v5/transformations", spec)
+    resp = client.post("/api/v5/message_transformations", spec)
     if resp.status_code not in (200, 201):
         print(f"  [ERROR]  transformation {name}: {resp.text}", file=sys.stderr)
         sys.exit(1)
