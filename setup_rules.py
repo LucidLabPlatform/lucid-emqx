@@ -2,8 +2,9 @@
 """
 EMQX Rule Engine provisioning for LUCID central command.
 
-Creates all data-integration connectors, actions, and rules that move
-every MQTT DB write out of Python and into EMQX directly.
+Creates all Smart Data Hub resources (schemas, validations, transformations)
+and data-integration resources (connectors, actions, rules) that enforce the
+LUCID message contract and move every MQTT DB write into EMQX directly.
 
 Idempotent — safe to re-run at any time.
 
@@ -21,6 +22,7 @@ Environment variables (all have sensible defaults):
     LUCID_DB_PASSWORD     Postgres password              (default: REDACTED)
 """
 
+import json
 import os
 import sys
 import time
@@ -638,6 +640,256 @@ def ensure_postgres_connector(client: EMQXClient) -> None:
     print("  [ok] lucid-postgres connector created")
 
 
+# ---------------------------------------------------------------------------
+# Smart Data Hub — Schema Registry
+# ---------------------------------------------------------------------------
+
+def _metric_cfg_schema() -> dict:
+    return {
+        "type": "object",
+        "properties": {
+            "enabled":    {"type": "boolean"},
+            "interval_s": {"type": "number"},
+            "threshold":  {"type": "number"},
+        },
+        "additionalProperties": False,
+    }
+
+
+def schemas() -> list[dict]:
+    def s(name: str, schema: dict) -> dict:
+        return {"name": name, "type": "json", "source": json.dumps(schema)}
+
+    return [
+        s("lucid-command", {
+            "type": "object",
+            "required": ["request_id"],
+            "properties": {
+                "request_id": {"type": "string"},
+            },
+            "additionalProperties": True,
+        }),
+        s("lucid-agent-metadata", {
+            "type": "object",
+            "required": ["version", "platform", "architecture"],
+            "properties": {
+                "version":      {"type": "string"},
+                "platform":     {"type": "string"},
+                "architecture": {"type": "string"},
+            },
+            "additionalProperties": True,
+        }),
+        s("lucid-agent-status", {
+            "type": "object",
+            "required": ["state"],
+            "properties": {
+                "state":           {"type": "string"},
+                "connected_since": {"type": "string"},
+                "uptime_s":        {"type": "number"},
+                "version":         {"type": "string"},
+            },
+            "additionalProperties": True,
+        }),
+        s("lucid-agent-state", {
+            "type": "object",
+            "properties": {
+                "cpu_percent":    {"type": "number"},
+                "memory_percent": {"type": "number"},
+                "disk_percent":   {"type": "number"},
+                "components":     {},
+            },
+            "additionalProperties": True,
+        }),
+        s("lucid-agent-cfg", {
+            "type": "object",
+            "required": ["heartbeat_s"],
+            "properties": {
+                "heartbeat_s": {"type": "number"},
+            },
+            "additionalProperties": True,
+        }),
+        s("lucid-agent-cfg-logging", {
+            "type": "object",
+            "required": ["level"],
+            "properties": {
+                "level": {"type": "string", "enum": ["debug", "info", "warning", "error"]},
+            },
+            "additionalProperties": False,
+        }),
+        s("lucid-agent-cfg-telemetry", {
+            "type": "object",
+            "properties": {
+                "cpu_percent":    _metric_cfg_schema(),
+                "memory_percent": _metric_cfg_schema(),
+                "disk_percent":   _metric_cfg_schema(),
+            },
+            "additionalProperties": True,
+        }),
+        s("lucid-telemetry", {
+            "type": "object",
+            "required": ["value"],
+            "properties": {
+                "value": {"type": "number"},
+            },
+            "additionalProperties": True,
+        }),
+        s("lucid-event-result", {
+            "type": "object",
+            "required": ["request_id", "ok"],
+            "properties": {
+                "request_id": {"type": "string"},
+                "ok":         {"type": "boolean"},
+                "action":     {"type": "string"},
+                "error":      {"type": ["string", "null"]},
+                "applied":    {},
+            },
+            "additionalProperties": True,
+        }),
+        s("lucid-component-metadata", {
+            "type": "object",
+            "required": ["version"],
+            "properties": {
+                "version":      {"type": "string"},
+                "capabilities": {},
+            },
+            "additionalProperties": True,
+        }),
+        s("lucid-component-status", {
+            "type": "object",
+            "required": ["state"],
+            "properties": {
+                "state": {"type": "string"},
+            },
+            "additionalProperties": True,
+        }),
+    ]
+
+
+def ensure_schema(client: EMQXClient, spec: dict) -> None:
+    name = spec["name"]
+    resp = client.get(f"/api/v5/schemas/{name}")
+    if resp.status_code == 200:
+        upd = client.put(f"/api/v5/schemas/{name}", spec)
+        if upd.status_code not in (200, 201):
+            print(f"  [ERROR]  schema update {name}: {upd.text}", file=sys.stderr)
+            sys.exit(1)
+        print(f"  [update] schema {name}")
+        return
+    resp = client.post("/api/v5/schemas", spec)
+    if resp.status_code not in (200, 201):
+        print(f"  [ERROR]  schema {name}: {resp.text}", file=sys.stderr)
+        sys.exit(1)
+    print(f"  [create] schema {name}")
+
+
+# ---------------------------------------------------------------------------
+# Smart Data Hub — Schema Validation
+# ---------------------------------------------------------------------------
+
+def schema_validations() -> list[dict]:
+    def v(name: str, topics: list[str], schema: str) -> dict:
+        return {
+            "name": name,
+            "topics": topics,
+            "strategy": "all_pass",
+            "failure_action": "drop",
+            "log_failure_at": "warning",
+            "checks": [{"type": "json_schema", "schema": schema}],
+        }
+
+    return [
+        # commands — all must carry request_id
+        v("validate-agent-cmd",     ["lucid/agents/+/cmd/#"],               "lucid-command"),
+        v("validate-component-cmd", ["lucid/agents/+/components/+/cmd/#"],  "lucid-command"),
+        # agent retained
+        v("validate-agent-metadata",      ["lucid/agents/+/metadata"],          "lucid-agent-metadata"),
+        v("validate-agent-status",        ["lucid/agents/+/status"],            "lucid-agent-status"),
+        v("validate-agent-state",         ["lucid/agents/+/state"],             "lucid-agent-state"),
+        v("validate-agent-cfg",           ["lucid/agents/+/cfg"],               "lucid-agent-cfg"),
+        v("validate-agent-cfg-logging",   ["lucid/agents/+/cfg/logging"],       "lucid-agent-cfg-logging"),
+        v("validate-agent-cfg-telemetry", ["lucid/agents/+/cfg/telemetry"],     "lucid-agent-cfg-telemetry"),
+        # agent streaming
+        v("validate-agent-telemetry", ["lucid/agents/+/telemetry/#"],           "lucid-telemetry"),
+        v("validate-agent-events",    ["lucid/agents/+/evt/#"],                 "lucid-event-result"),
+        # component retained
+        v("validate-component-metadata",      ["lucid/agents/+/components/+/metadata"],      "lucid-component-metadata"),
+        v("validate-component-status",        ["lucid/agents/+/components/+/status"],        "lucid-component-status"),
+        v("validate-component-cfg-logging",   ["lucid/agents/+/components/+/cfg/logging"],   "lucid-agent-cfg-logging"),
+        v("validate-component-cfg-telemetry", ["lucid/agents/+/components/+/cfg/telemetry"], "lucid-agent-cfg-telemetry"),
+        # component streaming
+        v("validate-component-telemetry", ["lucid/agents/+/components/+/telemetry/#"], "lucid-telemetry"),
+        v("validate-component-events",    ["lucid/agents/+/components/+/evt/#"],       "lucid-event-result"),
+    ]
+
+
+def ensure_schema_validation(client: EMQXClient, spec: dict) -> None:
+    name = spec["name"]
+    resp = client.get("/api/v5/schema_validations")
+    resp.raise_for_status()
+    existing_id = None
+    for item in resp.json().get("data", []):
+        if item.get("name") == name:
+            existing_id = item["id"]
+            break
+    if existing_id:
+        upd = client.put(f"/api/v5/schema_validations/{existing_id}", spec)
+        if upd.status_code not in (200, 201):
+            print(f"  [ERROR]  validation update {name}: {upd.text}", file=sys.stderr)
+            sys.exit(1)
+        print(f"  [update] validation {name}")
+        return
+    resp = client.post("/api/v5/schema_validations", spec)
+    if resp.status_code not in (200, 201):
+        print(f"  [ERROR]  validation {name}: {resp.text}", file=sys.stderr)
+        sys.exit(1)
+    print(f"  [create] validation {name}")
+
+
+# ---------------------------------------------------------------------------
+# Smart Data Hub — Message Transformation
+# ---------------------------------------------------------------------------
+
+def message_transformations() -> list[dict]:
+    return [
+        {
+            "name": "lucid-json-normalize",
+            "topics": ["lucid/#"],
+            "failure_action": "drop",
+            "log_failure_at": "warning",
+            "payload_decoder": {"type": "json"},
+            "payload_encoder": {"type": "json"},
+            "operations": [],
+        },
+    ]
+
+
+def ensure_message_transformation(client: EMQXClient, spec: dict) -> None:
+    name = spec["name"]
+    resp = client.get("/api/v5/transformations")
+    resp.raise_for_status()
+    existing_id = None
+    for item in resp.json().get("data", []):
+        if item.get("name") == name:
+            existing_id = item["id"]
+            break
+    if existing_id:
+        upd = client.put(f"/api/v5/transformations/{existing_id}", spec)
+        if upd.status_code not in (200, 201):
+            print(f"  [ERROR]  transformation update {name}: {upd.text}", file=sys.stderr)
+            sys.exit(1)
+        print(f"  [update] transformation {name}")
+        return
+    resp = client.post("/api/v5/transformations", spec)
+    if resp.status_code not in (200, 201):
+        print(f"  [ERROR]  transformation {name}: {resp.text}", file=sys.stderr)
+        sys.exit(1)
+    print(f"  [create] transformation {name}")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
 def main() -> None:
     print(f"Connecting to EMQX at {EMQX_URL} ...")
     client = EMQXClient()
@@ -645,7 +897,19 @@ def main() -> None:
 
     ensure_postgres_connector(client)
 
-    print("── Connectors ──────────────────────────────────")
+    print("── Schemas ─────────────────────────────────────")
+    for spec in schemas():
+        ensure_schema(client, spec)
+
+    print("\n── Schema Validations ──────────────────────────")
+    for spec in schema_validations():
+        ensure_schema_validation(client, spec)
+
+    print("\n── Message Transformations ─────────────────────")
+    for spec in message_transformations():
+        ensure_message_transformation(client, spec)
+
+    print("\n── Connectors ──────────────────────────────────")
     for spec in connectors():
         ensure_connector(client, spec)
 
@@ -657,7 +921,7 @@ def main() -> None:
     for spec in rules():
         ensure_rule(client, spec)
 
-    print("\nDone. All LUCID EMQX rules are in place.")
+    print("\nDone. All LUCID EMQX resources are in place.")
 
 
 if __name__ == "__main__":
