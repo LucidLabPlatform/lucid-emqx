@@ -12,11 +12,10 @@ Usage:
     python3 services/emqx/setup_rules.py
 
 Environment variables (all have sensible defaults):
-    EMQX_URL              EMQX management API base URL  (default: http://localhost:18083)
-    EMQX_USERNAME         EMQX dashboard username        (default: lucid)
-    EMQX_PASSWORD         EMQX dashboard password        (default: REDACTED)
-    LUCID_FLEET_CORE_URL  Fleet Core base URL            (default: http://lucid-fleet-core:5000)
-    LUCID_DB_HOST         Postgres host:port             (default: lucid-db:5432)
+    EMQX_URL          EMQX management API base URL  (default: http://localhost:18083)
+    EMQX_USERNAME     EMQX dashboard username        (default: lucid)
+    EMQX_PASSWORD     EMQX dashboard password        (default: REDACTED)
+    LUCID_DB_HOST     Postgres host:port             (default: lucid-db:5432)
     LUCID_DB_NAME         Postgres database name         (default: lucid)
     LUCID_DB_USER         Postgres username              (default: lucid)
     LUCID_DB_PASSWORD     Postgres password              (default: REDACTED)
@@ -32,10 +31,6 @@ import httpx
 EMQX_URL      = os.environ.get("EMQX_URL",      "http://localhost:18083")
 EMQX_USERNAME = os.environ.get("EMQX_USERNAME", "admin")
 EMQX_PASSWORD = os.environ.get("EMQX_PASSWORD", "public")
-LUCID_FLEET_CORE_URL = os.environ.get(
-    "LUCID_FLEET_CORE_URL",
-    "http://lucid-fleet-core:5000",
-)
 LUCID_DB_HOST     = os.environ.get("LUCID_DB_HOST",     "lucid-db:5432")
 LUCID_DB_NAME     = os.environ.get("LUCID_DB_NAME",     "lucid")
 LUCID_DB_USER     = os.environ.get("LUCID_DB_USER",     "lucid")
@@ -203,33 +198,12 @@ def _pgsql_action(name: str, sql: str) -> dict:
     }
 
 
-def _http_action(name: str, path: str) -> dict:
-    return {
-        "type": "http",
-        "name": name,
-        "connector": "lucid-cc-http",
-        "parameters": {
-            "path": path,
-            "method": "post",
-            "body": "${.}",
-        },
-    }
-
-
 # ---------------------------------------------------------------------------
 # Resource definitions
 # ---------------------------------------------------------------------------
 
 def connectors() -> list[dict]:
-    return [
-        {
-            "type": "http",
-            "name": "lucid-cc-http",
-            "url": LUCID_FLEET_CORE_URL,
-            "pool_size": 4,
-            "ssl": {"enable": False},
-        },
-    ]
+    return []
 
 
 def actions() -> list[dict]:
@@ -304,7 +278,10 @@ def actions() -> list[dict]:
         """),
 
         # ── agent streaming ──────────────────────────────────────────────
-        _http_action("agent-logs-http", "/api/internal/ingest-logs"),
+        _pgsql_action("agent-logs-sink", """
+            INSERT INTO logs (agent_id, component_id, payload, received_ts)
+            VALUES (${agent_id}, NULL, ${log_payload}, ${received_ts}::text::timestamptz)
+        """),
         _pgsql_action("agent-telemetry-sink", """
             INSERT INTO agent_telemetry (agent_id, metric, value, received_ts)
             VALUES (${agent_id}, ${metric}, ${value}::text::float8, ${received_ts}::text::timestamptz)
@@ -360,7 +337,10 @@ def actions() -> list[dict]:
         """),
 
         # ── component streaming ──────────────────────────────────────────
-        _http_action("component-logs-http", "/api/internal/ingest-logs"),
+        _pgsql_action("component-logs-sink", """
+            INSERT INTO logs (agent_id, component_id, payload, received_ts)
+            VALUES (${agent_id}, ${component_id}, ${log_payload}, ${received_ts}::text::timestamptz)
+        """),
         _pgsql_action("component-telemetry-sink", """
             INSERT INTO component_telemetry (agent_id, component_id, metric, value, received_ts)
             VALUES (${agent_id}, ${component_id}, ${metric}, ${value}::text::float8,
@@ -379,7 +359,10 @@ def actions() -> list[dict]:
         """),
 
         # ── client events ────────────────────────────────────────────────
-        _http_action("client-events-http", "/api/internal/client-event"),
+        _pgsql_action("client-events-sink", """
+            INSERT INTO client_events (agent_id, event_type, ts)
+            VALUES (${agent_id}, ${event_type}, ${ts}::text::timestamptz)
+        """),
     ]
 
 
@@ -589,7 +572,7 @@ def rules() -> list[dict]:
         rule("lucid:agent-cfg-logging",   agent_cfg_logging_sql,   ["pgsql:upsert-agents", "pgsql:agent-cfg-logging-sink"]),
         rule("lucid:agent-cfg-telemetry", agent_cfg_telemetry_sql, ["pgsql:upsert-agents", "pgsql:agent-cfg-telemetry-sink"]),
         # agent streaming
-        rule("lucid:agent-logs",          agent_logs_sql,          ["pgsql:upsert-agents", "http:agent-logs-http"]),
+        rule("lucid:agent-logs",          agent_logs_sql,          ["pgsql:upsert-agents", "pgsql:agent-logs-sink"]),
         rule("lucid:agent-telemetry",     agent_telemetry_sql,     ["pgsql:upsert-agents", "pgsql:agent-telemetry-sink"]),
         rule("lucid:agent-events",        agent_events_sql,        ["pgsql:upsert-agents", "pgsql:agent-events-sink", "pgsql:agent-commands-backfill"]),
         # component retained
@@ -600,11 +583,11 @@ def rules() -> list[dict]:
         rule("lucid:component-cfg-logging",   comp_cfg_logging_sql,   ["pgsql:upsert-agents", "pgsql:upsert-components", "pgsql:component-cfg-logging-sink"]),
         rule("lucid:component-cfg-telemetry", comp_cfg_telemetry_sql, ["pgsql:upsert-agents", "pgsql:upsert-components", "pgsql:component-cfg-telemetry-sink"]),
         # component streaming
-        rule("lucid:component-logs",          comp_logs_sql,          ["pgsql:upsert-agents", "pgsql:upsert-components", "http:component-logs-http"]),
+        rule("lucid:component-logs",          comp_logs_sql,          ["pgsql:upsert-agents", "pgsql:upsert-components", "pgsql:component-logs-sink"]),
         rule("lucid:component-telemetry",     comp_telemetry_sql,     ["pgsql:upsert-agents", "pgsql:upsert-components", "pgsql:component-telemetry-sink"]),
         rule("lucid:component-events",        comp_events_sql,        ["pgsql:upsert-agents", "pgsql:upsert-components", "pgsql:component-events-sink", "pgsql:component-commands-backfill"]),
         # client connect/disconnect
-        rule("lucid:client-events", client_events_sql, ["http:client-events-http"]),
+        rule("lucid:client-events", client_events_sql, ["pgsql:client-events-sink"]),
     ]
 
 
