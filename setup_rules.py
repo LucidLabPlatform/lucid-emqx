@@ -779,7 +779,7 @@ def schema_validations() -> list[dict]:
             "strategy": "all_pass",
             "failure_action": "drop",
             "log_failure": {"level": "warning"},
-            "checks": [{"type": "json_schema", "schema": schema}],
+            "checks": [{"type": "json", "schema": schema}],
         }
 
     return [
