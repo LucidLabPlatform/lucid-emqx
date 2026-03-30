@@ -363,7 +363,53 @@ def actions() -> list[dict]:
             INSERT INTO client_events (agent_id, event_type, ts)
             VALUES (${agent_id}, ${event_type}, ${ts}::text::timestamptz)
         """),
+
+        # ── rejected messages ────────────────────────────────────────────
+        _pgsql_action("rejected-messages-sink", """
+            INSERT INTO mqtt_rejected_messages (topic, agent_id, raw_payload, validation_name, received_ts)
+            VALUES (${topic}, ${agent_id}, ${raw_payload}, ${validation_name}, ${received_ts}::text::timestamptz)
+        """),
     ]
+
+
+# (description, topic_pattern, schema_name) — one entry per schema validation.
+# Each generates a rejection rule: fires when NOT schema_check() passes.
+_REJECTION_RULES: list[tuple[str, str, str]] = [
+    # commands
+    ("lucid:reject:agent-cmd",               "lucid/agents/+/cmd/#",                        "lucid-command"),
+    ("lucid:reject:component-cmd",           "lucid/agents/+/components/+/cmd/#",           "lucid-command"),
+    # agent retained
+    ("lucid:reject:agent-metadata",          "lucid/agents/+/metadata",                     "lucid-agent-metadata"),
+    ("lucid:reject:agent-status",            "lucid/agents/+/status",                       "lucid-agent-status"),
+    ("lucid:reject:agent-state",             "lucid/agents/+/state",                        "lucid-agent-state"),
+    ("lucid:reject:agent-cfg",               "lucid/agents/+/cfg",                          "lucid-agent-cfg"),
+    ("lucid:reject:agent-cfg-logging",       "lucid/agents/+/cfg/logging",                  "lucid-agent-cfg-logging"),
+    ("lucid:reject:agent-cfg-telemetry",     "lucid/agents/+/cfg/telemetry",                "lucid-agent-cfg-telemetry"),
+    # agent streaming
+    ("lucid:reject:agent-telemetry",         "lucid/agents/+/telemetry/#",                  "lucid-telemetry"),
+    ("lucid:reject:agent-events",            "lucid/agents/+/evt/#",                        "lucid-event-result"),
+    # component retained
+    ("lucid:reject:component-metadata",      "lucid/agents/+/components/+/metadata",        "lucid-component-metadata"),
+    ("lucid:reject:component-status",        "lucid/agents/+/components/+/status",          "lucid-component-status"),
+    ("lucid:reject:component-cfg-logging",   "lucid/agents/+/components/+/cfg/logging",     "lucid-agent-cfg-logging"),
+    ("lucid:reject:component-cfg-telemetry", "lucid/agents/+/components/+/cfg/telemetry",   "lucid-agent-cfg-telemetry"),
+    # component streaming
+    ("lucid:reject:component-telemetry",     "lucid/agents/+/components/+/telemetry/#",     "lucid-telemetry"),
+    ("lucid:reject:component-events",        "lucid/agents/+/components/+/evt/#",           "lucid-event-result"),
+]
+
+
+def _rejection_sql(topic_pattern: str, schema_name: str) -> str:
+    return f"""
+        SELECT
+            topic,
+            clientid as agent_id,
+            json_encode(payload) as raw_payload,
+            '{schema_name}' as validation_name,
+            now_rfc3339() as received_ts
+        FROM "{topic_pattern}"
+        WHERE NOT schema_check('{schema_name}', payload)
+    """
 
 
 def rules() -> list[dict]:
@@ -385,6 +431,7 @@ def rules() -> list[dict]:
             payload.architecture as architecture,
             now_rfc3339() as received_ts
         FROM "lucid/agents/+/metadata"
+        WHERE schema_check('lucid-agent-metadata', payload)
     """
 
     agent_status_sql = f"""
@@ -396,6 +443,7 @@ def rules() -> list[dict]:
             payload.version as version,
             now_rfc3339() as received_ts
         FROM "lucid/agents/+/status"
+        WHERE schema_check('lucid-agent-status', payload)
     """
 
     agent_state_sql = f"""
@@ -407,6 +455,7 @@ def rules() -> list[dict]:
             payload.components as components,
             now_rfc3339() as received_ts
         FROM "lucid/agents/+/state"
+        WHERE schema_check('lucid-agent-state', payload)
     """
 
     agent_cfg_sql = f"""
@@ -415,6 +464,7 @@ def rules() -> list[dict]:
             payload.heartbeat_s as heartbeat_s,
             now_rfc3339() as received_ts
         FROM "lucid/agents/+/cfg"
+        WHERE schema_check('lucid-agent-cfg', payload)
     """
 
     agent_cfg_logging_sql = f"""
@@ -423,6 +473,7 @@ def rules() -> list[dict]:
             payload.level as log_level,
             now_rfc3339() as received_ts
         FROM "lucid/agents/+/cfg/logging"
+        WHERE schema_check('lucid-agent-cfg-logging', payload)
     """
 
     agent_cfg_telemetry_sql = f"""
@@ -439,6 +490,7 @@ def rules() -> list[dict]:
             payload.disk_percent.threshold as disk_pct_threshold,
             now_rfc3339() as received_ts
         FROM "lucid/agents/+/cfg/telemetry"
+        WHERE schema_check('lucid-agent-cfg-telemetry', payload)
     """
 
     agent_logs_sql = f"""
@@ -457,6 +509,7 @@ def rules() -> list[dict]:
             now_rfc3339() as received_ts
         FROM "lucid/agents/+/telemetry/#"
         WHERE is_not_null(payload.value)
+          AND schema_check('lucid-telemetry', payload)
     """
 
     agent_events_sql = """
@@ -469,6 +522,7 @@ def rules() -> list[dict]:
             payload.applied as applied,
             now_rfc3339() as received_ts
         FROM "lucid/agents/+/evt/#"
+        WHERE schema_check('lucid-event-result', payload)
     """
 
     # ── component-level rules ────────────────────────────────────────────
@@ -480,6 +534,7 @@ def rules() -> list[dict]:
             payload.capabilities as capabilities,
             now_rfc3339() as received_ts
         FROM "lucid/agents/+/components/+/metadata"
+        WHERE schema_check('lucid-component-metadata', payload)
     """
 
     comp_status_sql = f"""
@@ -488,6 +543,7 @@ def rules() -> list[dict]:
             payload.state as state,
             now_rfc3339() as received_ts
         FROM "lucid/agents/+/components/+/status"
+        WHERE schema_check('lucid-component-status', payload)
     """
 
     # component state/cfg/cfg_telemetry payloads are stored as raw JSONB
@@ -513,6 +569,7 @@ def rules() -> list[dict]:
             payload.level as log_level,
             now_rfc3339() as received_ts
         FROM "lucid/agents/+/components/+/cfg/logging"
+        WHERE schema_check('lucid-agent-cfg-logging', payload)
     """
 
     comp_cfg_telemetry_sql = f"""
@@ -521,6 +578,7 @@ def rules() -> list[dict]:
             payload as comp_payload,
             now_rfc3339() as received_ts
         FROM "lucid/agents/+/components/+/cfg/telemetry"
+        WHERE schema_check('lucid-agent-cfg-telemetry', payload)
     """
 
     comp_logs_sql = f"""
@@ -540,6 +598,7 @@ def rules() -> list[dict]:
             now_rfc3339() as received_ts
         FROM "lucid/agents/+/components/+/telemetry/#"
         WHERE is_not_null(payload.value)
+          AND schema_check('lucid-telemetry', payload)
     """
 
     comp_events_sql = """
@@ -553,6 +612,7 @@ def rules() -> list[dict]:
             payload.error as error,
             now_rfc3339() as received_ts
         FROM "lucid/agents/+/components/+/evt/#"
+        WHERE schema_check('lucid-event-result', payload)
     """
 
     client_events_sql = """
@@ -588,6 +648,12 @@ def rules() -> list[dict]:
         rule("lucid:component-events",        comp_events_sql,        ["pgsql:upsert-agents", "pgsql:upsert-components", "pgsql:component-events-sink", "pgsql:component-commands-backfill"]),
         # client connect/disconnect
         rule("lucid:client-events", client_events_sql, ["pgsql:client-events-sink"]),
+
+        # rejected messages — one rule per schema validation
+        *[
+            rule(desc, _rejection_sql(topic, schema), ["pgsql:rejected-messages-sink"])
+            for desc, topic, schema in _REJECTION_RULES
+        ],
     ]
 
 
@@ -777,7 +843,11 @@ def schema_validations() -> list[dict]:
             "topics": topics,
             "enable": True,
             "strategy": "all_pass",
-            "failure_action": "drop",
+            # "ignore" so invalid messages reach the rule engine where
+            # NOT schema_check() rejection rules capture them to Postgres.
+            # The JSON normalization transformation still uses "drop" because
+            # non-JSON payloads cannot be decoded or meaningfully stored.
+            "failure_action": "ignore",
             "log_failure": {"level": "warning"},
             "checks": [{"type": "json", "schema": schema}],
         }
