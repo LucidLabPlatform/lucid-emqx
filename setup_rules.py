@@ -176,6 +176,39 @@ def _component_ids_from_topic(_prefix: str) -> str:
     )
 
 
+def _agent_id_from_command_topic() -> str:
+    """Extract agent_id from a command topic path instead of publisher clientid."""
+    return "nth(3, split(topic, '/')) as agent_id"
+
+
+def _component_ids_from_command_topic() -> str:
+    """Extract agent_id and component_id from component command topic paths."""
+    return (
+        "nth(3, split(topic, '/')) as agent_id, "
+        "nth(5, split(topic, '/')) as component_id"
+    )
+
+
+def _agent_command_action_from_topic() -> str:
+    """
+    Extract the full action suffix from:
+    lucid/agents/{agent_id}/cmd/{action...}
+    """
+    return "substr(topic, strlen(nth(3, split(topic, '/'))) + 19) as action"
+
+
+def _component_command_action_from_topic() -> str:
+    """
+    Extract the full action suffix from:
+    lucid/agents/{agent_id}/components/{component_id}/cmd/{action...}
+    """
+    return (
+        "substr(topic, "
+        "strlen(nth(3, split(topic, '/'))) + strlen(nth(5, split(topic, '/'))) + 31"
+        ") as action"
+    )
+
+
 UPSERT_AGENTS_SQL = """
 INSERT INTO agents (agent_id, first_seen_ts, last_seen_ts)
 VALUES (${agent_id}, ${received_ts}::text::timestamptz, ${received_ts}::text::timestamptz)
@@ -282,6 +315,17 @@ def actions() -> list[dict]:
             INSERT INTO logs (agent_id, component_id, payload, received_ts)
             VALUES (${agent_id}, NULL, ${log_payload}, ${received_ts}::text::timestamptz)
         """),
+        _pgsql_action("agent-commands-sink", """
+            INSERT INTO commands (
+                request_id, agent_id, component_id, action, topic, payload,
+                publisher_username, publisher_clientid, result_received, sent_ts
+            )
+            VALUES (
+                ${request_id}, ${agent_id}, NULL, ${action}, ${topic}, ${command_payload},
+                ${publisher_username}, ${publisher_clientid}, false, ${sent_ts}::text::timestamptz
+            )
+            ON CONFLICT (request_id) DO NOTHING
+        """),
         _pgsql_action("agent-telemetry-sink", """
             INSERT INTO agent_telemetry (agent_id, metric, value, received_ts)
             VALUES (${agent_id}, ${metric}, ${value}::text::float8, ${received_ts}::text::timestamptz)
@@ -293,8 +337,10 @@ def actions() -> list[dict]:
         """),
         _pgsql_action("agent-commands-backfill", """
             UPDATE commands
-            SET result_ok=${ok}::text::boolean, result_ts=${received_ts}::text::timestamptz
-            WHERE request_id=${request_id} AND result_ok IS NULL AND ${request_id} != ''
+            SET result_received=true,
+                result_ok=${ok}::text::boolean,
+                result_ts=${received_ts}::text::timestamptz
+            WHERE request_id=${request_id} AND result_received = false AND ${request_id} != ''
         """),
 
         # ── component retained ───────────────────────────────────────────
@@ -341,6 +387,17 @@ def actions() -> list[dict]:
             INSERT INTO logs (agent_id, component_id, payload, received_ts)
             VALUES (${agent_id}, ${component_id}, ${log_payload}, ${received_ts}::text::timestamptz)
         """),
+        _pgsql_action("component-commands-sink", """
+            INSERT INTO commands (
+                request_id, agent_id, component_id, action, topic, payload,
+                publisher_username, publisher_clientid, result_received, sent_ts
+            )
+            VALUES (
+                ${request_id}, ${agent_id}, ${component_id}, ${action}, ${topic}, ${command_payload},
+                ${publisher_username}, ${publisher_clientid}, false, ${sent_ts}::text::timestamptz
+            )
+            ON CONFLICT (request_id) DO NOTHING
+        """),
         _pgsql_action("component-telemetry-sink", """
             INSERT INTO component_telemetry (agent_id, component_id, metric, value, received_ts)
             VALUES (${agent_id}, ${component_id}, ${metric}, ${value}::text::float8,
@@ -354,14 +411,24 @@ def actions() -> list[dict]:
         """),
         _pgsql_action("component-commands-backfill", """
             UPDATE commands
-            SET result_ok=${ok}::text::boolean, result_ts=${received_ts}::text::timestamptz
-            WHERE request_id=${request_id} AND result_ok IS NULL AND ${request_id} != ''
+            SET result_received=true,
+                result_ok=${ok}::text::boolean,
+                result_ts=${received_ts}::text::timestamptz
+            WHERE request_id=${request_id} AND result_received = false AND ${request_id} != ''
         """),
 
         # ── client events ────────────────────────────────────────────────
         _pgsql_action("client-events-sink", """
             INSERT INTO client_events (agent_id, event_type, ts)
             VALUES (${agent_id}, ${event_type}, ${ts}::text::timestamptz)
+        """),
+        _pgsql_action("authn-log-sink", """
+            INSERT INTO authn_log (ts, username, clientid, result)
+            VALUES (${ts}::text::timestamptz, ${username}, ${clientid}, ${result})
+        """),
+        _pgsql_action("authz-log-sink", """
+            INSERT INTO authz_log (ts, username, clientid, topic, action, result)
+            VALUES (${ts}::text::timestamptz, ${username}, ${clientid}, ${topic}, ${action}, ${result})
         """),
 
         # ── rejected messages ────────────────────────────────────────────
@@ -501,6 +568,21 @@ def rules() -> list[dict]:
         FROM "lucid/agents/+/logs"
     """
 
+    agent_commands_sql = f"""
+        SELECT
+            {_agent_id_from_command_topic()},
+            {_agent_command_action_from_topic()},
+            payload.request_id as request_id,
+            topic as topic,
+            payload as command_payload,
+            username as publisher_username,
+            clientid as publisher_clientid,
+            now_rfc3339() as sent_ts,
+            now_rfc3339() as received_ts
+        FROM "lucid/agents/+/cmd/#"
+        WHERE schema_check('lucid-command', payload)
+    """
+
     agent_telemetry_sql = """
         SELECT
             clientid as agent_id,
@@ -589,6 +671,21 @@ def rules() -> list[dict]:
         FROM "lucid/agents/+/components/+/logs"
     """
 
+    comp_commands_sql = f"""
+        SELECT
+            {_component_ids_from_command_topic()},
+            {_component_command_action_from_topic()},
+            payload.request_id as request_id,
+            topic as topic,
+            payload as command_payload,
+            username as publisher_username,
+            clientid as publisher_clientid,
+            now_rfc3339() as sent_ts,
+            now_rfc3339() as received_ts
+        FROM "lucid/agents/+/components/+/cmd/#"
+        WHERE schema_check('lucid-command', payload)
+    """
+
     comp_telemetry_sql = """
         SELECT
             clientid as agent_id,
@@ -623,6 +720,26 @@ def rules() -> list[dict]:
         FROM "$events/client_connected", "$events/client_disconnected"
     """
 
+    authn_log_sql = """
+        SELECT
+            coalesce(username, '') as username,
+            clientid as clientid,
+            coalesce(reason_code, 'unknown') as result,
+            now_rfc3339() as ts
+        FROM "$events/client_check_authn_complete"
+    """
+
+    authz_log_sql = """
+        SELECT
+            coalesce(username, '') as username,
+            clientid as clientid,
+            topic as topic,
+            action as action,
+            coalesce(result, 'unknown') as result,
+            now_rfc3339() as ts
+        FROM "$events/client_check_authz_complete"
+    """
+
     return [
         # agent retained
         rule("lucid:agent-metadata",      agent_metadata_sql,      ["pgsql:upsert-agents", "pgsql:agent-metadata-sink"]),
@@ -633,6 +750,7 @@ def rules() -> list[dict]:
         rule("lucid:agent-cfg-telemetry", agent_cfg_telemetry_sql, ["pgsql:upsert-agents", "pgsql:agent-cfg-telemetry-sink"]),
         # agent streaming
         rule("lucid:agent-logs",          agent_logs_sql,          ["pgsql:upsert-agents", "pgsql:agent-logs-sink"]),
+        rule("lucid:agent-commands",      agent_commands_sql,      ["pgsql:upsert-agents", "pgsql:agent-commands-sink"]),
         rule("lucid:agent-telemetry",     agent_telemetry_sql,     ["pgsql:upsert-agents", "pgsql:agent-telemetry-sink"]),
         rule("lucid:agent-events",        agent_events_sql,        ["pgsql:upsert-agents", "pgsql:agent-events-sink", "pgsql:agent-commands-backfill"]),
         # component retained
@@ -644,10 +762,13 @@ def rules() -> list[dict]:
         rule("lucid:component-cfg-telemetry", comp_cfg_telemetry_sql, ["pgsql:upsert-agents", "pgsql:upsert-components", "pgsql:component-cfg-telemetry-sink"]),
         # component streaming
         rule("lucid:component-logs",          comp_logs_sql,          ["pgsql:upsert-agents", "pgsql:upsert-components", "pgsql:component-logs-sink"]),
+        rule("lucid:component-commands",      comp_commands_sql,      ["pgsql:upsert-agents", "pgsql:upsert-components", "pgsql:component-commands-sink"]),
         rule("lucid:component-telemetry",     comp_telemetry_sql,     ["pgsql:upsert-agents", "pgsql:upsert-components", "pgsql:component-telemetry-sink"]),
         rule("lucid:component-events",        comp_events_sql,        ["pgsql:upsert-agents", "pgsql:upsert-components", "pgsql:component-events-sink", "pgsql:component-commands-backfill"]),
         # client connect/disconnect
         rule("lucid:client-events", client_events_sql, ["pgsql:client-events-sink"]),
+        rule("lucid:authn-log", authn_log_sql, ["pgsql:authn-log-sink"]),
+        rule("lucid:authz-log", authz_log_sql, ["pgsql:authz-log-sink"]),
 
         # rejected messages — one rule per schema validation
         *[
