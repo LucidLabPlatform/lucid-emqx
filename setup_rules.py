@@ -148,14 +148,14 @@ def ensure_rule(client: EMQXClient, spec: dict) -> None:
 
 def _agent_id_from_topic(_prefix: str) -> str:
     """
-    Extract agent_id from the MQTT client ID.
+    Extract agent_id from the MQTT topic path.
 
-    In LUCID every agent connects with its agent_id as the MQTT clientid,
-    so we can use `clientid` directly instead of regex-extracting from the
-    topic string. (EMQX 6.x dropped support for nth/regex_match topic
-    extraction — use clientid + substr instead.)
+    Agent MQTT usernames and topic namespaces use the canonical agent_id.
+    MQTT client IDs may include a presentation prefix such as
+    ``lucid.agent.<agent_id>`` and should not be treated as canonical fleet
+    identity.
     """
-    return "clientid as agent_id"
+    return "nth(3, split(topic, '/')) as agent_id"
 
 
 def _component_ids_from_topic(_prefix: str) -> str:
@@ -163,16 +163,45 @@ def _component_ids_from_topic(_prefix: str) -> str:
     Extract agent_id and component_id from component topics.
 
     Topic pattern: lucid/agents/{agent_id}/components/{component_id}/...
-    - agent_id  = MQTT clientid (always equal to agent_id in LUCID)
-    - component_id = first path segment after '/components/'
-
-    The prefix 'lucid/agents/' is 13 chars; '/components/' is 12 chars.
-    Total fixed prefix = strlen(clientid) + 25. EMQX substr is 1-indexed, so
-    component_id starts at position strlen(clientid) + 26.
+    Canonical agent identity comes from the topic path, not the MQTT client ID.
     """
     return (
-        "clientid as agent_id, "
-        "nth(1, split(substr(topic, strlen(clientid)+26), '/')) as component_id"
+        "nth(3, split(topic, '/')) as agent_id, "
+        "nth(5, split(topic, '/')) as component_id"
+    )
+
+
+def _normalized_agent_id_from_client() -> str:
+    """Normalize clientid-based broker events to the canonical agent_id."""
+    return (
+        "CASE "
+        "WHEN substr(clientid, 1, 12) = 'lucid.agent.' THEN substr(clientid, 13) "
+        "ELSE clientid "
+        "END as agent_id"
+    )
+
+
+def _agent_metric_from_topic() -> str:
+    return "substr(topic, strlen(nth(3, split(topic, '/'))) + 25) as metric"
+
+
+def _agent_event_action_from_topic() -> str:
+    return "coalesce(payload.action, substr(topic, strlen(nth(3, split(topic, '/'))) + 19)) as action"
+
+
+def _component_metric_from_topic() -> str:
+    return (
+        "substr(topic, "
+        "strlen(nth(3, split(topic, '/'))) + strlen(nth(5, split(topic, '/'))) + 37"
+        ") as metric"
+    )
+
+
+def _component_event_action_from_topic() -> str:
+    return (
+        "coalesce(payload.action, substr(topic, "
+        "strlen(nth(3, split(topic, '/'))) + strlen(nth(5, split(topic, '/'))) + 31"
+        ")) as action"
     )
 
 
@@ -583,10 +612,10 @@ def rules() -> list[dict]:
         WHERE schema_check('lucid-command', payload)
     """
 
-    agent_telemetry_sql = """
+    agent_telemetry_sql = f"""
         SELECT
-            clientid as agent_id,
-            substr(topic, strlen(clientid)+25) as metric,
+            {_agent_id_from_topic('telemetry')},
+            {_agent_metric_from_topic()},
             payload.value as value,
             now_rfc3339() as received_ts
         FROM "lucid/agents/+/telemetry/#"
@@ -594,10 +623,10 @@ def rules() -> list[dict]:
           AND schema_check('lucid-telemetry', payload)
     """
 
-    agent_events_sql = """
+    agent_events_sql = f"""
         SELECT
-            clientid as agent_id,
-            coalesce(payload.action, substr(topic, strlen(clientid)+19)) as action,
+            {_agent_id_from_topic('evt')},
+            {_agent_event_action_from_topic()},
             coalesce(payload.request_id, '') as request_id,
             coalesce(payload.ok, coalesce(payload.success, false)) as ok,
             payload.error as error,
@@ -686,11 +715,10 @@ def rules() -> list[dict]:
         WHERE schema_check('lucid-command', payload)
     """
 
-    comp_telemetry_sql = """
+    comp_telemetry_sql = f"""
         SELECT
-            clientid as agent_id,
-            nth(1, split(substr(topic, strlen(clientid)+26), '/')) as component_id,
-            nth(3, split(substr(topic, strlen(clientid)+26), '/')) as metric,
+            {_component_ids_from_topic('telemetry')},
+            {_component_metric_from_topic()},
             payload.value as value,
             now_rfc3339() as received_ts
         FROM "lucid/agents/+/components/+/telemetry/#"
@@ -698,11 +726,10 @@ def rules() -> list[dict]:
           AND schema_check('lucid-telemetry', payload)
     """
 
-    comp_events_sql = """
+    comp_events_sql = f"""
         SELECT
-            clientid as agent_id,
-            nth(1, split(substr(topic, strlen(clientid)+26), '/')) as component_id,
-            coalesce(payload.action, nth(3, split(substr(topic, strlen(clientid)+26), '/'))) as action,
+            {_component_ids_from_topic('evt')},
+            {_component_event_action_from_topic()},
             coalesce(payload.request_id, '') as request_id,
             coalesce(payload.ok, coalesce(payload.success, false)) as ok,
             payload.applied as applied,
@@ -714,11 +741,11 @@ def rules() -> list[dict]:
 
     client_events_sql = """
         SELECT
-            clientid as agent_id,
+            {_normalized_agent_id_from_client()},
             event as event_type,
             now_rfc3339() as ts
         FROM "$events/client_connected", "$events/client_disconnected"
-    """
+    """.format(_normalized_agent_id_from_client=_normalized_agent_id_from_client())
 
     authn_log_sql = """
         SELECT

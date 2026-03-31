@@ -114,7 +114,7 @@ lucid/agents/{agent_id}/
 
 Every command payload must include `{"request_id": "<uuid>"}`. Every command produces a corresponding `evt/{action}/result` with `{request_id, ok, error}`.
 
-Agent MQTT client IDs must equal the agent's `agent_id` — the provisioner rules rely on `clientid` to extract `agent_id` without regex topic parsing.
+Agent MQTT usernames and topic namespaces use the canonical `agent_id`. MQTT client IDs may include a presentation prefix such as `lucid.agent.<agent_id>`; the broker normalises those back to the canonical `agent_id` during ingestion.
 
 ---
 
