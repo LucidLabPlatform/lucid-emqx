@@ -429,7 +429,7 @@ def actions() -> list[dict]:
         """),
         _pgsql_action("component-telemetry-sink", """
             INSERT INTO component_telemetry (agent_id, component_id, metric, value, received_ts)
-            VALUES (${agent_id}, ${component_id}, ${metric}, ${value}::text::float8,
+            VALUES (${agent_id}, ${component_id}, ${metric}, ${value_json}::jsonb,
                     ${received_ts}::text::timestamptz)
         """),
         _pgsql_action("component-events-sink", """
@@ -719,11 +719,10 @@ def rules() -> list[dict]:
         SELECT
             {_component_ids_from_topic('telemetry')},
             {_component_metric_from_topic()},
-            payload.value as value,
+            json_encode(payload.value) as value_json,
             now_rfc3339() as received_ts
         FROM "lucid/agents/+/components/+/telemetry/#"
         WHERE is_not_null(payload.value)
-          AND is_num(payload.value)
           AND schema_check('lucid-telemetry', payload)
     """
 
