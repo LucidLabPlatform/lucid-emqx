@@ -723,6 +723,7 @@ def rules() -> list[dict]:
             now_rfc3339() as received_ts
         FROM "lucid/agents/+/components/+/telemetry/#"
         WHERE is_not_null(payload.value)
+          AND is_num(payload.value)
           AND schema_check('lucid-telemetry', payload)
     """
 
