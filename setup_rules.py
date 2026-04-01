@@ -739,13 +739,13 @@ def rules() -> list[dict]:
         WHERE schema_check('lucid-event-result', payload)
     """
 
-    client_events_sql = """
+    client_events_sql = f"""
         SELECT
             {_normalized_agent_id_from_client()},
             event as event_type,
             now_rfc3339() as ts
         FROM "$events/client_connected", "$events/client_disconnected"
-    """.format(_normalized_agent_id_from_client=_normalized_agent_id_from_client())
+    """
 
     authn_log_sql = """
         SELECT
