@@ -182,17 +182,17 @@ def _normalized_agent_id_from_client() -> str:
 
 
 def _agent_metric_from_topic() -> str:
-    return "substr(topic, strlen(nth(3, split(topic, '/'))) + 25) as metric"
+    return "substr(topic, strlen(nth(3, split(topic, '/'))) + 24) as metric"
 
 
 def _agent_event_action_from_topic() -> str:
-    return "coalesce(payload.action, substr(topic, strlen(nth(3, split(topic, '/'))) + 19)) as action"
+    return "coalesce(payload.action, substr(topic, strlen(nth(3, split(topic, '/'))) + 18)) as action"
 
 
 def _component_metric_from_topic() -> str:
     return (
         "substr(topic, "
-        "strlen(nth(3, split(topic, '/'))) + strlen(nth(5, split(topic, '/'))) + 37"
+        "strlen(nth(3, split(topic, '/'))) + strlen(nth(5, split(topic, '/'))) + 36"
         ") as metric"
     )
 
@@ -200,7 +200,7 @@ def _component_metric_from_topic() -> str:
 def _component_event_action_from_topic() -> str:
     return (
         "coalesce(payload.action, substr(topic, "
-        "strlen(nth(3, split(topic, '/'))) + strlen(nth(5, split(topic, '/'))) + 31"
+        "strlen(nth(3, split(topic, '/'))) + strlen(nth(5, split(topic, '/'))) + 30"
         ")) as action"
     )
 
@@ -223,7 +223,7 @@ def _agent_command_action_from_topic() -> str:
     Extract the full action suffix from:
     lucid/agents/{agent_id}/cmd/{action...}
     """
-    return "substr(topic, strlen(nth(3, split(topic, '/'))) + 19) as action"
+    return "substr(topic, strlen(nth(3, split(topic, '/'))) + 18) as action"
 
 
 def _component_command_action_from_topic() -> str:
@@ -233,7 +233,7 @@ def _component_command_action_from_topic() -> str:
     """
     return (
         "substr(topic, "
-        "strlen(nth(3, split(topic, '/'))) + strlen(nth(5, split(topic, '/'))) + 31"
+        "strlen(nth(3, split(topic, '/'))) + strlen(nth(5, split(topic, '/'))) + 30"
         ") as action"
     )
 
