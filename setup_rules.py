@@ -294,7 +294,7 @@ def actions() -> list[dict]:
         _pgsql_action("agent-state-sink", """
             INSERT INTO agent_state (agent_id, cpu_percent, memory_percent, disk_percent, components, received_ts)
             VALUES (${agent_id}, ${cpu_percent}::text::float8, ${memory_percent}::text::float8,
-                    ${disk_percent}::text::float8, ${components}, ${received_ts}::text::timestamptz)
+                    ${disk_percent}::text::float8, ${components}::jsonb, ${received_ts}::text::timestamptz)
             ON CONFLICT (agent_id) DO UPDATE SET
                 cpu_percent=EXCLUDED.cpu_percent, memory_percent=EXCLUDED.memory_percent,
                 disk_percent=EXCLUDED.disk_percent, components=EXCLUDED.components,
@@ -375,7 +375,7 @@ def actions() -> list[dict]:
         # ── component retained ───────────────────────────────────────────
         _pgsql_action("component-metadata-sink", """
             INSERT INTO component_metadata (agent_id, component_id, version, capabilities, received_ts)
-            VALUES (${agent_id}, ${component_id}, ${version}, ${capabilities}, ${received_ts}::text::timestamptz)
+            VALUES (${agent_id}, ${component_id}, ${version}, ${capabilities}::jsonb, ${received_ts}::text::timestamptz)
             ON CONFLICT (agent_id, component_id) DO UPDATE SET
                 version=EXCLUDED.version, capabilities=EXCLUDED.capabilities,
                 received_ts=EXCLUDED.received_ts
@@ -548,7 +548,7 @@ def rules() -> list[dict]:
             payload.cpu_percent as cpu_percent,
             payload.memory_percent as memory_percent,
             payload.disk_percent as disk_percent,
-            payload.components as components,
+            json_encode(payload.components) as components,
             now_rfc3339() as received_ts
         FROM "lucid/agents/+/state"
         WHERE schema_check('lucid-agent-state', payload)
@@ -642,7 +642,7 @@ def rules() -> list[dict]:
         SELECT
             {_component_ids_from_topic('metadata')},
             payload.version as version,
-            payload.capabilities as capabilities,
+            json_encode(payload.capabilities) as capabilities,
             now_rfc3339() as received_ts
         FROM "lucid/agents/+/components/+/metadata"
         WHERE schema_check('lucid-component-metadata', payload)
