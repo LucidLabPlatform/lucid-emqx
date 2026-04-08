@@ -283,12 +283,12 @@ def actions() -> list[dict]:
                 architecture=EXCLUDED.architecture, received_ts=EXCLUDED.received_ts
         """),
         _pgsql_action("agent-status-sink", """
-            INSERT INTO agent_status (agent_id, state, connected_since_ts, uptime_s, version, received_ts)
+            INSERT INTO agent_status (agent_id, state, connected_since_ts, uptime_s, received_ts)
             VALUES (${agent_id}, ${state}, ${connected_since_ts}::text::timestamptz, ${uptime_s}::text::float8,
-                    ${version}, ${received_ts}::text::timestamptz)
+                    ${received_ts}::text::timestamptz)
             ON CONFLICT (agent_id) DO UPDATE SET
                 state=EXCLUDED.state, connected_since_ts=EXCLUDED.connected_since_ts,
-                uptime_s=EXCLUDED.uptime_s, version=EXCLUDED.version,
+                uptime_s=EXCLUDED.uptime_s,
                 received_ts=EXCLUDED.received_ts
         """),
         _pgsql_action("agent-state-sink", """
@@ -536,7 +536,6 @@ def rules() -> list[dict]:
             payload.state as state,
             payload.connected_since as connected_since_ts,
             payload.uptime_s as uptime_s,
-            payload.version as version,
             now_rfc3339() as received_ts
         FROM "lucid/agents/+/status"
         WHERE schema_check('lucid-agent-status', payload)
@@ -787,11 +786,11 @@ def rules() -> list[dict]:
         rule("lucid:component-cfg",           comp_cfg_sql,           ["pgsql:upsert-agents", "pgsql:upsert-components", "pgsql:component-cfg-sink"]),
         rule("lucid:component-cfg-logging",   comp_cfg_logging_sql,   ["pgsql:upsert-agents", "pgsql:upsert-components", "pgsql:component-cfg-logging-sink"]),
         rule("lucid:component-cfg-telemetry", comp_cfg_telemetry_sql, ["pgsql:upsert-agents", "pgsql:upsert-components", "pgsql:component-cfg-telemetry-sink"]),
-        # component streaming
-        rule("lucid:component-logs",          comp_logs_sql,          ["pgsql:upsert-agents", "pgsql:upsert-components", "pgsql:component-logs-sink"]),
-        rule("lucid:component-commands",      comp_commands_sql,      ["pgsql:upsert-agents", "pgsql:upsert-components", "pgsql:component-commands-sink"]),
-        rule("lucid:component-telemetry",     comp_telemetry_sql,     ["pgsql:upsert-agents", "pgsql:upsert-components", "pgsql:component-telemetry-sink"]),
-        rule("lucid:component-events",        comp_events_sql,        ["pgsql:upsert-agents", "pgsql:upsert-components", "pgsql:component-events-sink", "pgsql:component-commands-backfill"]),
+        # component streaming — no upsert-components: only retained topics should create component records
+        rule("lucid:component-logs",          comp_logs_sql,          ["pgsql:upsert-agents", "pgsql:component-logs-sink"]),
+        rule("lucid:component-commands",      comp_commands_sql,      ["pgsql:upsert-agents", "pgsql:component-commands-sink"]),
+        rule("lucid:component-telemetry",     comp_telemetry_sql,     ["pgsql:upsert-agents", "pgsql:component-telemetry-sink"]),
+        rule("lucid:component-events",        comp_events_sql,        ["pgsql:upsert-agents", "pgsql:component-events-sink", "pgsql:component-commands-backfill"]),
         # client connect/disconnect
         rule("lucid:client-events", client_events_sql, ["pgsql:client-events-sink"]),
         rule("lucid:authn-log", authn_log_sql, ["pgsql:authn-log-sink"]),
