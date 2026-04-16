@@ -292,12 +292,10 @@ def actions() -> list[dict]:
                 received_ts=EXCLUDED.received_ts
         """),
         _pgsql_action("agent-state-sink", """
-            INSERT INTO agent_state (agent_id, cpu_percent, memory_percent, disk_percent, components, received_ts)
-            VALUES (${agent_id}, ${cpu_percent}::text::float8, ${memory_percent}::text::float8,
-                    ${disk_percent}::text::float8, ${components}::jsonb, ${received_ts}::text::timestamptz)
+            INSERT INTO agent_state (agent_id, components, received_ts)
+            VALUES (${agent_id}, ${components}::jsonb, ${received_ts}::text::timestamptz)
             ON CONFLICT (agent_id) DO UPDATE SET
-                cpu_percent=EXCLUDED.cpu_percent, memory_percent=EXCLUDED.memory_percent,
-                disk_percent=EXCLUDED.disk_percent, components=EXCLUDED.components,
+                components=EXCLUDED.components,
                 received_ts=EXCLUDED.received_ts
         """),
         _pgsql_action("agent-cfg-sink", """
@@ -360,9 +358,9 @@ def actions() -> list[dict]:
             VALUES (${agent_id}, ${metric}, ${value}::text::float8, ${received_ts}::text::timestamptz)
         """),
         _pgsql_action("agent-events-sink", """
-            INSERT INTO agent_events (agent_id, action, request_id, ok, error, received_ts)
+            INSERT INTO agent_events (agent_id, action, request_id, ok, error, applied, received_ts)
             VALUES (${agent_id}, ${action}, ${request_id}, ${ok}::text::boolean,
-                    ${error}, ${received_ts}::text::timestamptz)
+                    ${error}, ${applied}::jsonb, ${received_ts}::text::timestamptz)
         """),
         _pgsql_action("agent-commands-backfill", """
             UPDATE commands
@@ -436,7 +434,7 @@ def actions() -> list[dict]:
             INSERT INTO component_events
                 (agent_id, component_id, action, request_id, ok, applied, error, received_ts)
             VALUES (${agent_id}, ${component_id}, ${action}, ${request_id},
-                    ${ok}::text::boolean, ${applied}, ${error}, ${received_ts}::text::timestamptz)
+                    ${ok}::text::boolean, ${applied}::jsonb, ${error}, ${received_ts}::text::timestamptz)
         """),
         _pgsql_action("component-commands-backfill", """
             UPDATE commands
@@ -455,8 +453,16 @@ def actions() -> list[dict]:
             INSERT INTO authn_log (ts, username, clientid, result)
             VALUES (${ts}::text::timestamptz, ${username}, ${clientid}, ${result})
         """),
+        _pgsql_action("authn-denied-sink", """
+            INSERT INTO authn_denied (ts, username, clientid, result)
+            VALUES (${ts}::text::timestamptz, ${username}, ${clientid}, ${result})
+        """),
         _pgsql_action("authz-log-sink", """
             INSERT INTO authz_log (ts, username, clientid, topic, action, result)
+            VALUES (${ts}::text::timestamptz, ${username}, ${clientid}, ${topic}, ${action}, ${result})
+        """),
+        _pgsql_action("authz-denied-sink", """
+            INSERT INTO authz_denied (ts, username, clientid, topic, action, result)
             VALUES (${ts}::text::timestamptz, ${username}, ${clientid}, ${topic}, ${action}, ${result})
         """),
 
@@ -499,7 +505,7 @@ def _rejection_sql(topic_pattern: str, schema_name: str) -> str:
     return f"""
         SELECT
             topic,
-            clientid as agent_id,
+            {_normalized_agent_id_from_client()},
             json_encode(payload) as raw_payload,
             '{schema_name}' as validation_name,
             now_rfc3339() as received_ts
@@ -534,7 +540,7 @@ def rules() -> list[dict]:
         SELECT
             {_agent_id_from_topic('status')},
             payload.state as state,
-            payload.connected_since as connected_since_ts,
+            payload.connected_since_ts as connected_since_ts,
             payload.uptime_s as uptime_s,
             now_rfc3339() as received_ts
         FROM "lucid/agents/+/status"
@@ -544,9 +550,6 @@ def rules() -> list[dict]:
     agent_state_sql = f"""
         SELECT
             {_agent_id_from_topic('state')},
-            payload.cpu_percent as cpu_percent,
-            payload.memory_percent as memory_percent,
-            payload.disk_percent as disk_percent,
             json_encode(payload.components) as components,
             now_rfc3339() as received_ts
         FROM "lucid/agents/+/state"
@@ -565,7 +568,7 @@ def rules() -> list[dict]:
     agent_cfg_logging_sql = f"""
         SELECT
             {_agent_id_from_topic('cfg/logging')},
-            payload.level as log_level,
+            payload.log_level as log_level,
             now_rfc3339() as received_ts
         FROM "lucid/agents/+/cfg/logging"
         WHERE schema_check('lucid-agent-cfg-logging', payload)
@@ -576,13 +579,13 @@ def rules() -> list[dict]:
             {_agent_id_from_topic('cfg/telemetry')},
             payload.cpu_percent.enabled as cpu_pct_enabled,
             payload.cpu_percent.interval_s as cpu_pct_interval_s,
-            payload.cpu_percent.threshold as cpu_pct_threshold,
+            payload.cpu_percent.change_threshold_percent as cpu_pct_threshold,
             payload.memory_percent.enabled as memory_pct_enabled,
             payload.memory_percent.interval_s as memory_pct_interval_s,
-            payload.memory_percent.threshold as memory_pct_threshold,
+            payload.memory_percent.change_threshold_percent as memory_pct_threshold,
             payload.disk_percent.enabled as disk_pct_enabled,
             payload.disk_percent.interval_s as disk_pct_interval_s,
-            payload.disk_percent.threshold as disk_pct_threshold,
+            payload.disk_percent.change_threshold_percent as disk_pct_threshold,
             now_rfc3339() as received_ts
         FROM "lucid/agents/+/cfg/telemetry"
         WHERE schema_check('lucid-agent-cfg-telemetry', payload)
@@ -605,8 +608,7 @@ def rules() -> list[dict]:
             payload as command_payload,
             username as publisher_username,
             clientid as publisher_clientid,
-            now_rfc3339() as sent_ts,
-            now_rfc3339() as received_ts
+            now_rfc3339() as sent_ts
         FROM "lucid/agents/+/cmd/#"
         WHERE schema_check('lucid-command', payload)
     """
@@ -676,7 +678,7 @@ def rules() -> list[dict]:
     comp_cfg_logging_sql = f"""
         SELECT
             {_component_ids_from_topic('cfg/logging')},
-            payload.level as log_level,
+            payload.log_level as log_level,
             now_rfc3339() as received_ts
         FROM "lucid/agents/+/components/+/cfg/logging"
         WHERE schema_check('lucid-agent-cfg-logging', payload)
@@ -708,8 +710,7 @@ def rules() -> list[dict]:
             payload as command_payload,
             username as publisher_username,
             clientid as publisher_clientid,
-            now_rfc3339() as sent_ts,
-            now_rfc3339() as received_ts
+            now_rfc3339() as sent_ts
         FROM "lucid/agents/+/components/+/cmd/#"
         WHERE schema_check('lucid-command', payload)
     """
@@ -755,6 +756,16 @@ def rules() -> list[dict]:
         FROM "$events/client_check_authn_complete"
     """
 
+    authn_denied_sql = """
+        SELECT
+            coalesce(username, '') as username,
+            clientid as clientid,
+            coalesce(reason_code, 'unknown') as result,
+            now_rfc3339() as ts
+        FROM "$events/client_check_authn_complete"
+        WHERE reason_code != 'success'
+    """
+
     authz_log_sql = """
         SELECT
             coalesce(username, '') as username,
@@ -764,6 +775,18 @@ def rules() -> list[dict]:
             coalesce(result, 'unknown') as result,
             now_rfc3339() as ts
         FROM "$events/client_check_authz_complete"
+    """
+
+    authz_denied_sql = """
+        SELECT
+            coalesce(username, '') as username,
+            clientid as clientid,
+            topic as topic,
+            action as action,
+            coalesce(result, 'unknown') as result,
+            now_rfc3339() as ts
+        FROM "$events/client_check_authz_complete"
+        WHERE result = 'deny'
     """
 
     return [
@@ -793,8 +816,10 @@ def rules() -> list[dict]:
         rule("lucid:component-events",        comp_events_sql,        ["pgsql:upsert-agents", "pgsql:component-events-sink", "pgsql:component-commands-backfill"]),
         # client connect/disconnect
         rule("lucid:client-events", client_events_sql, ["pgsql:client-events-sink"]),
-        rule("lucid:authn-log", authn_log_sql, ["pgsql:authn-log-sink"]),
-        rule("lucid:authz-log", authz_log_sql, ["pgsql:authz-log-sink"]),
+        rule("lucid:authn-log",    authn_log_sql,    ["pgsql:authn-log-sink"]),
+        rule("lucid:authn-denied", authn_denied_sql, ["pgsql:authn-denied-sink"]),
+        rule("lucid:authz-log",    authz_log_sql,    ["pgsql:authz-log-sink"]),
+        rule("lucid:authz-denied", authz_denied_sql, ["pgsql:authz-denied-sink"]),
 
         # rejected messages — one rule per schema validation
         *[
@@ -844,9 +869,9 @@ def _metric_cfg_schema() -> dict:
     return {
         "type": "object",
         "properties": {
-            "enabled":    {"type": "boolean"},
-            "interval_s": {"type": "number"},
-            "threshold":  {"type": "number"},
+            "enabled":                   {"type": "boolean"},
+            "interval_s":                {"type": "number"},
+            "change_threshold_percent":  {"type": "number"},
         },
         "additionalProperties": False,
     }
@@ -879,20 +904,16 @@ def schemas() -> list[dict]:
             "type": "object",
             "required": ["state"],
             "properties": {
-                "state":           {"type": "string"},
-                "connected_since": {"type": "string"},
-                "uptime_s":        {"type": "number"},
-                "version":         {"type": "string"},
+                "state":               {"type": "string"},
+                "connected_since_ts":  {"type": "string"},
+                "uptime_s":            {"type": "number"},
             },
             "additionalProperties": True,
         }),
         s("lucid-agent-state", {
             "type": "object",
             "properties": {
-                "cpu_percent":    {"type": "number"},
-                "memory_percent": {"type": "number"},
-                "disk_percent":   {"type": "number"},
-                "components":     {},
+                "components": {},
             },
             "additionalProperties": True,
         }),
@@ -906,9 +927,9 @@ def schemas() -> list[dict]:
         }),
         s("lucid-agent-cfg-logging", {
             "type": "object",
-            "required": ["level"],
+            "required": ["log_level"],
             "properties": {
-                "level": {"type": "string", "enum": ["debug", "info", "warning", "error"]},
+                "log_level": {"type": "string", "enum": ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]},
             },
             "additionalProperties": False,
         }),
@@ -925,7 +946,7 @@ def schemas() -> list[dict]:
             "type": "object",
             "required": ["value"],
             "properties": {
-                "value": {},
+                "value": {"type": "number"},
             },
             "additionalProperties": True,
         }),

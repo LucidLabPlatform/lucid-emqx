@@ -73,6 +73,24 @@ class ExpectedResources:
     rule_descriptions: list[str]
 
 
+def _extract_rejection_rule_names() -> list[str]:
+    """Extract rule descriptions from the module-level _REJECTION_RULES list."""
+    module = ast.parse(SETUP_RULES.read_text())
+    for node in module.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == "_REJECTION_RULES":
+                    names: list[str] = []
+                    if isinstance(node.value, ast.List):
+                        for elt in node.value.elts:
+                            if isinstance(elt, ast.Tuple) and elt.elts:
+                                name = _string_value(elt.elts[0])
+                                if name:
+                                    names.append(name)
+                    return names
+    return []
+
+
 def expected_resources() -> ExpectedResources:
     return ExpectedResources(
         connector_id="pgsql:lucid-postgres",
@@ -80,7 +98,7 @@ def expected_resources() -> ExpectedResources:
         validations=_extract_named_calls("schema_validations", "v"),
         transformations=_extract_transformation_names(),
         actions=_extract_named_calls("actions", "_pgsql_action"),
-        rule_descriptions=_extract_named_calls("rules", "rule"),
+        rule_descriptions=_extract_named_calls("rules", "rule") + _extract_rejection_rule_names(),
     )
 
 
