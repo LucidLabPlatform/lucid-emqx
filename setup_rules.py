@@ -946,7 +946,7 @@ def schemas() -> list[dict]:
             "type": "object",
             "required": ["value"],
             "properties": {
-                "value": {"type": "number"},
+                "value": {},
             },
             "additionalProperties": True,
         }),
