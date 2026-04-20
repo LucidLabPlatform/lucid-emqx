@@ -337,6 +337,23 @@ def actions() -> list[dict]:
                 received_ts=EXCLUDED.received_ts
         """),
 
+        _pgsql_action("agent-schema-sink", """
+            INSERT INTO agent_schema (agent_id, publishes, subscribes, received_ts)
+            VALUES (${agent_id}, ${publishes}::jsonb, ${subscribes}::jsonb, ${received_ts}::text::timestamptz)
+            ON CONFLICT (agent_id) DO UPDATE SET
+                publishes=EXCLUDED.publishes,
+                subscribes=EXCLUDED.subscribes,
+                received_ts=EXCLUDED.received_ts
+        """),
+        _pgsql_action("component-schema-sink", """
+            INSERT INTO component_schema (agent_id, component_id, publishes, subscribes, received_ts)
+            VALUES (${agent_id}, ${component_id}, ${publishes}::jsonb, ${subscribes}::jsonb, ${received_ts}::text::timestamptz)
+            ON CONFLICT (agent_id, component_id) DO UPDATE SET
+                publishes=EXCLUDED.publishes,
+                subscribes=EXCLUDED.subscribes,
+                received_ts=EXCLUDED.received_ts
+        """),
+
         # ── agent streaming ──────────────────────────────────────────────
         _pgsql_action("agent-logs-sink", """
             INSERT INTO logs (agent_id, component_id, payload, received_ts)
@@ -487,6 +504,8 @@ _REJECTION_RULES: list[tuple[str, str, str]] = [
     ("lucid:reject:agent-cfg",               "lucid/agents/+/cfg",                          "lucid-agent-cfg"),
     ("lucid:reject:agent-cfg-logging",       "lucid/agents/+/cfg/logging",                  "lucid-agent-cfg-logging"),
     ("lucid:reject:agent-cfg-telemetry",     "lucid/agents/+/cfg/telemetry",                "lucid-agent-cfg-telemetry"),
+    ("lucid:reject:agent-schema",            "lucid/agents/+/schema",                       "lucid-schema-topic"),
+    ("lucid:reject:component-schema",        "lucid/agents/+/components/+/schema",          "lucid-schema-topic"),
     # agent streaming
     ("lucid:reject:agent-telemetry",         "lucid/agents/+/telemetry/#",                  "lucid-telemetry"),
     ("lucid:reject:agent-events",            "lucid/agents/+/evt/#",                        "lucid-event-result"),
@@ -589,6 +608,26 @@ def rules() -> list[dict]:
             now_rfc3339() as received_ts
         FROM "lucid/agents/+/cfg/telemetry"
         WHERE schema_check('lucid-agent-cfg-telemetry', payload)
+    """
+
+    agent_schema_sql = f"""
+        SELECT
+            {_agent_id_from_topic('schema')},
+            json_encode(payload.publishes) as publishes,
+            json_encode(payload.subscribes) as subscribes,
+            now_rfc3339() as received_ts
+        FROM "lucid/agents/+/schema"
+        WHERE schema_check('lucid-schema-topic', payload)
+    """
+
+    comp_schema_sql = f"""
+        SELECT
+            {_component_ids_from_topic('schema')},
+            json_encode(payload.publishes) as publishes,
+            json_encode(payload.subscribes) as subscribes,
+            now_rfc3339() as received_ts
+        FROM "lucid/agents/+/components/+/schema"
+        WHERE schema_check('lucid-schema-topic', payload)
     """
 
     agent_logs_sql = f"""
@@ -797,6 +836,7 @@ def rules() -> list[dict]:
         rule("lucid:agent-cfg",           agent_cfg_sql,           ["pgsql:upsert-agents", "pgsql:agent-cfg-sink"]),
         rule("lucid:agent-cfg-logging",   agent_cfg_logging_sql,   ["pgsql:upsert-agents", "pgsql:agent-cfg-logging-sink"]),
         rule("lucid:agent-cfg-telemetry", agent_cfg_telemetry_sql, ["pgsql:upsert-agents", "pgsql:agent-cfg-telemetry-sink"]),
+        rule("lucid:agent-schema",        agent_schema_sql,        ["pgsql:upsert-agents", "pgsql:agent-schema-sink"]),
         # agent streaming
         rule("lucid:agent-logs",          agent_logs_sql,          ["pgsql:upsert-agents", "pgsql:agent-logs-sink"]),
         rule("lucid:agent-commands",      agent_commands_sql,      ["pgsql:upsert-agents", "pgsql:agent-commands-sink"]),
@@ -809,6 +849,7 @@ def rules() -> list[dict]:
         rule("lucid:component-cfg",           comp_cfg_sql,           ["pgsql:upsert-agents", "pgsql:upsert-components", "pgsql:component-cfg-sink"]),
         rule("lucid:component-cfg-logging",   comp_cfg_logging_sql,   ["pgsql:upsert-agents", "pgsql:upsert-components", "pgsql:component-cfg-logging-sink"]),
         rule("lucid:component-cfg-telemetry", comp_cfg_telemetry_sql, ["pgsql:upsert-agents", "pgsql:upsert-components", "pgsql:component-cfg-telemetry-sink"]),
+        rule("lucid:component-schema",        comp_schema_sql,        ["pgsql:upsert-agents", "pgsql:upsert-components", "pgsql:component-schema-sink"]),
         # component streaming — no upsert-components: only retained topics should create component records
         rule("lucid:component-logs",          comp_logs_sql,          ["pgsql:upsert-agents", "pgsql:component-logs-sink"]),
         rule("lucid:component-commands",      comp_commands_sql,      ["pgsql:upsert-agents", "pgsql:component-commands-sink"]),
@@ -976,6 +1017,14 @@ def schemas() -> list[dict]:
             "required": ["state"],
             "properties": {
                 "state": {"type": "string"},
+            },
+            "additionalProperties": True,
+        }),
+        s("lucid-schema-topic", {
+            "type": "object",
+            "properties": {
+                "publishes":  {"type": "array"},
+                "subscribes": {"type": "array"},
             },
             "additionalProperties": True,
         }),
