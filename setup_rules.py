@@ -276,11 +276,12 @@ def actions() -> list[dict]:
 
         # ── agent retained ───────────────────────────────────────────────
         _pgsql_action("agent-metadata-sink", """
-            INSERT INTO agent_metadata (agent_id, version, platform, architecture, received_ts)
-            VALUES (${agent_id}, ${version}, ${platform}, ${architecture}, ${received_ts}::text::timestamptz)
+            INSERT INTO agent_metadata (agent_id, version, platform, architecture, ip_address, received_ts)
+            VALUES (${agent_id}, ${version}, ${platform}, ${architecture}, ${ip_address}, ${received_ts}::text::timestamptz)
             ON CONFLICT (agent_id) DO UPDATE SET
                 version=EXCLUDED.version, platform=EXCLUDED.platform,
-                architecture=EXCLUDED.architecture, received_ts=EXCLUDED.received_ts
+                architecture=EXCLUDED.architecture, ip_address=EXCLUDED.ip_address,
+                received_ts=EXCLUDED.received_ts
         """),
         _pgsql_action("agent-status-sink", """
             INSERT INTO agent_status (agent_id, state, connected_since_ts, uptime_s, received_ts)
@@ -550,6 +551,7 @@ def rules() -> list[dict]:
             payload.version as version,
             payload.platform as platform,
             payload.architecture as architecture,
+            payload.ip_address as ip_address,
             now_rfc3339() as received_ts
         FROM "lucid/agents/+/metadata"
         WHERE schema_check('lucid-agent-metadata', payload)
@@ -938,6 +940,7 @@ def schemas() -> list[dict]:
                 "version":      {"type": "string"},
                 "platform":     {"type": "string"},
                 "architecture": {"type": "string"},
+                "ip_address":   {"type": "string"},
             },
             "additionalProperties": True,
         }),
