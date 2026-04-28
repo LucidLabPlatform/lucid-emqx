@@ -239,9 +239,10 @@ def _component_command_action_from_topic() -> str:
 
 
 UPSERT_AGENTS_SQL = """
-INSERT INTO agents (agent_id, first_seen_ts, last_seen_ts)
-VALUES (${agent_id}, ${received_ts}::text::timestamptz, ${received_ts}::text::timestamptz)
-ON CONFLICT (agent_id) DO UPDATE SET last_seen_ts = EXCLUDED.last_seen_ts
+UPDATE mqtt_users
+SET last_seen_ts  = ${received_ts}::text::timestamptz,
+    first_seen_ts = COALESCE(first_seen_ts, ${received_ts}::text::timestamptz)
+WHERE username = ${agent_id} AND role = 'agent'
 """.strip()
 
 UPSERT_COMPONENTS_SQL = """
