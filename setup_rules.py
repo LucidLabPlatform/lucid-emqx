@@ -476,10 +476,6 @@ def actions() -> list[dict]:
             INSERT INTO authn_denied (ts, username, clientid, result)
             VALUES (${ts}::text::timestamptz, ${username}, ${clientid}, ${result})
         """),
-        _pgsql_action("authz-log-sink", """
-            INSERT INTO authz_log (ts, username, clientid, topic, action, result)
-            VALUES (${ts}::text::timestamptz, ${username}, ${clientid}, ${topic}, ${action}, ${result})
-        """),
         _pgsql_action("authz-denied-sink", """
             INSERT INTO authz_denied (ts, username, clientid, topic, action, result)
             VALUES (${ts}::text::timestamptz, ${username}, ${clientid}, ${topic}, ${action}, ${result})
@@ -808,17 +804,6 @@ def rules() -> list[dict]:
         WHERE reason_code != 'success'
     """
 
-    authz_log_sql = """
-        SELECT
-            coalesce(username, '') as username,
-            clientid as clientid,
-            topic as topic,
-            action as action,
-            coalesce(result, 'unknown') as result,
-            now_rfc3339() as ts
-        FROM "$events/client_check_authz_complete"
-    """
-
     authz_denied_sql = """
         SELECT
             coalesce(username, '') as username,
@@ -862,7 +847,6 @@ def rules() -> list[dict]:
         rule("lucid:client-events", client_events_sql, ["pgsql:client-events-sink"]),
         rule("lucid:authn-log",    authn_log_sql,    ["pgsql:authn-log-sink"]),
         rule("lucid:authn-denied", authn_denied_sql, ["pgsql:authn-denied-sink"]),
-        rule("lucid:authz-log",    authz_log_sql,    ["pgsql:authz-log-sink"]),
         rule("lucid:authz-denied", authz_denied_sql, ["pgsql:authz-denied-sink"]),
 
         # rejected messages — one rule per schema validation
