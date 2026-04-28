@@ -1027,8 +1027,12 @@ def schemas() -> list[dict]:
         s("lucid-schema-topic", {
             "type": "object",
             "properties": {
-                "publishes":  {"type": "array"},
-                "subscribes": {"type": "array"},
+                # Agents emit publishes/subscribes as objects keyed by topic
+                # name, not arrays. Keep the validator permissive on the
+                # top-level shape; the per-topic structure is checked at
+                # consumer-time.
+                "publishes":  {"type": "object"},
+                "subscribes": {"type": "object"},
             },
             "additionalProperties": True,
         }),
